@@ -340,6 +340,8 @@ public:
 
     [[nodiscard]] std::uint32_t logical_page_capacity() const noexcept;
     [[nodiscard]] std::int32_t row_count() const noexcept;
+    [[nodiscard]] std::uint32_t free_row_count() const noexcept;
+    [[nodiscard]] bool row_bound(std::int32_t row) const noexcept;
     [[nodiscard]] KVExecutionRowLease acquire(std::int32_t row);
 
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,

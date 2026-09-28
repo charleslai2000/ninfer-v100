@@ -14,7 +14,8 @@ function(ninfer_cuda_archive target)
 endfunction()
 
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
-add_library(ninfer_core STATIC
+if(NOT NINFER_BUILD_F6C2B_TEST)
+  add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
   core/dtype.cpp
@@ -24,6 +25,7 @@ add_library(ninfer_core STATIC
   core/host_kv_arena.cpp
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
+  core/candidate_continuation.cpp
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
@@ -33,23 +35,32 @@ add_library(ninfer_core STATIC
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp)
 ninfer_internal_includes(ninfer_core)
+target_include_directories(ninfer_core PRIVATE ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+else()
+  add_library(ninfer_core STATIC core/device.cu)
+  ninfer_internal_includes(ninfer_core)
+  ninfer_cuda_archive(ninfer_core)
+  target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+endif()
 
 # Generic .ninfer framing, binding, and direct final materialization.
+if(NOT NINFER_BUILD_F6C2B_TEST)
 add_library(ninfer_artifact STATIC
   artifact/reader.cpp
+  artifact/v3_reader.cpp
+  artifact/v3_inspector.cpp
   artifact/storage_layouts.cpp
   artifact/binder.cpp
   artifact/materializer.cpp
   artifact/typed_binding.cpp)
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
+endif()
 
-# Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from producer
-# warpgroups to consumer warpgroups. Relocatable device code makes ptxas discard that contract, so
-# these self-contained kernels are intentionally compiled in a non-RDC archive and called through
-# host launchers from ninfer_ops.
+# Warp-specialized SM120 NVFP4 kernels are outside the isolated F6C2B scan target.
+if(NOT NINFER_BUILD_F6C2B_TEST)
 add_library(ninfer_nvfp4_non_rdc STATIC
   ops/linear/nvfp4/nvfp4_w4a4_tma.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
@@ -63,9 +74,23 @@ set_target_properties(ninfer_nvfp4_non_rdc PROPERTIES
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
 target_compile_options(ninfer_nvfp4_non_rdc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+endif()
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
+add_library(ninfer_falcon_mamba_ssd STATIC
+  ops/linear_attention/falcon_mamba_ssd/falcon_mamba_ssd.cu)
+ninfer_internal_includes(ninfer_falcon_mamba_ssd)
+target_link_libraries(ninfer_falcon_mamba_ssd PUBLIC ninfer_core CUDA::cudart)
+if(NINFER_BUILD_F6C2B_TEST OR NINFER_BUILD_F6C2C_TEST)
+  return()
+endif()
+
+add_library(ninfer_gptq_g128 STATIC
+  ops/linear/gptq/gptq_g128.cu)
+ninfer_internal_includes(ninfer_gptq_g128)
+target_link_libraries(ninfer_gptq_g128 PUBLIC ninfer_core CUDA::cudart)
+
 add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
@@ -393,10 +418,12 @@ add_library(ninfer_text STATIC
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
 
-add_library(ninfer_media_decode STATIC
-  media/decode/decode.cpp)
-ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+if(NINFER_BUILD_MEDIA_DECODE)
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+  target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+endif()
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
@@ -407,6 +434,9 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)
+  if(NOT NINFER_BUILD_MEDIA_ACQUIRE)
+    message(FATAL_ERROR "NINFER_BUILD_PROMPT_INPUT requires NINFER_BUILD_MEDIA_ACQUIRE")
+  endif()
   # Owning command-line message input shared by product entry points and target diagnostics.
   add_library(ninfer_product_prompt_input STATIC
     product/prompt_input/prompt_input.cpp)
@@ -435,14 +465,17 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
+add_subdirectory(targets/falcon_h1)
 
 target_link_libraries(ninfer_engine
   PRIVATE
     ninfer_artifact
     ninfer_core
     ninfer_ops
-    ninfer_text
-    ninfer_media_decode)
+    ninfer_text)
+if(NINFER_BUILD_MEDIA_DECODE)
+  target_link_libraries(ninfer_engine PRIVATE ninfer_media_decode)
+endif()
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)

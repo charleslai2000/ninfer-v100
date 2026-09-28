@@ -82,6 +82,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::GPTQ_Q4_G128_FP16:
+        return "gptq_q4_g128_fp16";
     }
     return {};
 }
@@ -96,6 +98,8 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::GPTQ_CANONICAL_K128_V1:
+        return "gptq_canonical_k128_v1";
     }
     return {};
 }
@@ -137,6 +141,16 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::GPTQ_CANONICAL_K128_V1) {
+        if (format != NumericFormat::GPTQ_Q4_G128_FP16 || shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || shape[0] % 8 != 0 || shape[1] % 128 != 0) throw ArtifactError("gptq_canonical_k128_v1 requires [N,K], N%8=0, K%128=0");
+        const auto n=shape[0], k=shape[1], groups=k/128;
+        const auto q=checked_mul(checked_mul(k/8,n,"GPTQ qweight"),4,"GPTQ qweight");
+        const auto z=checked_mul(checked_mul(groups,n/8,"GPTQ qzeros"),4,"GPTQ qzeros");
+        const auto s=checked_mul(checked_mul(groups,n,"GPTQ scales"),2,"GPTQ scales");
+        const auto zo=align_up(q,256,"GPTQ qzeros offset");
+        const auto so=align_up(checked_add(zo,z,"GPTQ scales offset"),256,"GPTQ scales offset");
+        return checked_add(so,s,"GPTQ encoded size");
     }
     throw ArtifactError("unknown tensor layout");
 }

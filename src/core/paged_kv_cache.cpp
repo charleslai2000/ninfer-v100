@@ -746,6 +746,15 @@ std::uint32_t KVExecutionTablePool::logical_page_capacity() const noexcept {
 
 std::int32_t KVExecutionTablePool::row_count() const noexcept { return spec_.table_rows; }
 
+std::uint32_t KVExecutionTablePool::free_row_count() const noexcept {
+    return static_cast<std::uint32_t>(std::count(row_in_use_.begin(), row_in_use_.end(), false));
+}
+
+bool KVExecutionTablePool::row_bound(std::int32_t row_index) const noexcept {
+    return row_index >= 0 && row_index < spec_.table_rows &&
+           row_in_use_[static_cast<std::size_t>(row_index)];
+}
+
 KVExecutionRowLease KVExecutionTablePool::acquire(std::int32_t row_index) {
     if (row_index < 0 || row_index >= row_count()) {
         throw std::out_of_range("Paged KV execution row is out of range");

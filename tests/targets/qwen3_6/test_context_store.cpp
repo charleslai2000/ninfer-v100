@@ -70,12 +70,26 @@ void test_state_store(ninfer::DeviceContext& device) {
     const auto source = images.reserve_reset(device.stream);
     expect(source.has_value(), "state source allocation");
     const std::int32_t original_slot = images.physical_slot(*source);
+    const std::uint64_t original_epoch = images.content_epoch(*source);
+    {
+        auto source_pin = images.pin_candidate_source(*source);
+        expect(images.content_epoch(*source) == original_epoch &&
+                   images.role(*source) == store::StateImageRole::CandidateSourcePinned &&
+                   images.source_pins(*source) == 1,
+               "candidate source pin preserves committed epoch while blocking writers");
+        expect(!images.release(*source), "pinned recurrent source cannot be released");
+    }
+    expect(images.content_epoch(*source) == original_epoch &&
+               images.role(*source) == store::StateImageRole::ActiveMutable &&
+               images.source_pins(*source) == 0,
+           "source pin rollback restores active role without version change");
     images.freeze(*source);
     images.move_checkpoint_to_active(*source);
     expect(images.physical_slot(*source) == original_slot &&
                images.role(*source) == store::StateImageRole::ActiveMutable,
            "private Move preserves the logical image and physical slot");
     images.freeze(*source);
+    const std::uint64_t pinned_source_epoch = images.content_epoch(*source);
     const auto destination = images.reserve_destination();
     expect(destination.has_value(), "state destination reservation");
     const store::StateImageSelectors selectors = images.begin_fork(*source, *destination);
@@ -97,6 +111,8 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(!images.release(*source) && !images.release(*destination),
            "fork pins both logical images");
     images.commit_fork(*source, *destination);
+    expect(images.content_epoch(*source) == pinned_source_epoch,
+           "fork commit preserves committed source version");
     expect(images.role(*source) == store::StateImageRole::CheckpointImmutable &&
                images.role(*destination) == store::StateImageRole::ActiveMutable,
            "fork commit preserves source and activates destination");
@@ -221,6 +237,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(pages.occupied() == 2 && addresses.mapped_pages(*address) == 2,
            "endpoint and rewrite requirements share one ordered page mapping");
     const std::uint64_t old_epoch = addresses.content_epoch(*address, 0);
+    auto rollback_lease = addresses.prepare_rollback_activation(*address, 3, 1);
+    expect(rollback_lease.valid() && physical_pages.reserved_pages() == 2,
+           "rollback reactivation lease pre-reserves growth and execution row");
 
     addresses.deactivate(*address);
     expect(addresses.bound_row(*address) == -1 && addresses.entitlement(*address) == 2,
@@ -232,6 +251,24 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.active_address_references(logical_pages[1]) == 0 &&
                !addresses.has_active_reference(logical_pages[0]),
            "KV deactivation clears logical-page active references");
+    const auto fork_destination = addresses.create_inactive();
+    expect(fork_destination.has_value(), "candidate prefix-fork destination allocated");
+    {
+        auto candidate_fork = addresses.prepare_prefix_fork(*address, *fork_destination, 65, 3, 0);
+        expect(candidate_fork.needs_tail_copy() && rollback_lease.valid() &&
+                   physical_pages.reserved_pages() >= 2,
+               "candidate CoW reservation coexists with held rollback activation lease");
+        physical_pages.copy_page(addresses.prefix_fork_tail_source(candidate_fork),
+                                 addresses.prefix_fork_tail_destination(candidate_fork),
+                                 device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    }
+    expect(addresses.committed_frontier(*address) == 65 &&
+               pages.active_address_references(logical_pages[0]) == 0 &&
+               pages.active_address_references(logical_pages[1]) == 0 &&
+               physical_pages.reserved_pages() == 1,
+           "aborted partial-tail candidate fork restores shared refs and retains rollback lease");
+    expect(addresses.release(*fork_destination), "aborted candidate fork destination releases");
     addresses.set_checkpoint_requirement(*address, 32);
     expect(pages.protected_columns(logical_pages[0]) == 32 &&
                pages.protected_columns(logical_pages[1]) == 0,
@@ -298,11 +335,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
     pages.publish_device_replica(logical_pages[1]);
     expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
            "KV Host restore republishes Device replicas before releasing the extent");
-    auto activation = addresses.prepare_activation(*address, 3, 1);
-    expect(addresses.bound_row(*address) == -1 && addresses.entitlement(*address) == 2 &&
-               physical_pages.reserved_pages() == 1,
-           "prepared KV activation preserves the catalogued mapping until publication");
-    addresses.commit_activation(std::move(activation), device.stream);
+    addresses.restore_with_rollback_lease(std::move(rollback_lease), device.stream);
+    expect(addresses.active(*address) && addresses.bound_row(*address) == 1 &&
+               addresses.entitlement(*address) == 3 && addresses.committed_frontier(*address) == 65,
+           "pre-reserved rollback lease reactivates source without reacquiring capacity");
     expect(pages.active_address_references(logical_pages[0]) == 1 &&
                pages.active_address_references(logical_pages[1]) == 1,
            "KV reactivation republishes logical-page active references");

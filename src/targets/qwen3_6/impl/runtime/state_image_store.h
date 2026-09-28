@@ -12,6 +12,7 @@
 namespace ninfer::targets::qwen3_6::detail {
 
 class StateImageStore;
+class StateImageSourcePin;
 
 class StateImageHandle {
 public:
@@ -38,6 +39,7 @@ enum class StateImageRole : std::uint8_t {
     ActiveMutable,
     CheckpointImmutable,
     ReservedDestination,
+    CandidateSourcePinned,
 };
 
 enum class StateReplicaResidency : std::uint8_t {
@@ -56,6 +58,27 @@ enum class StateTransferDirection : std::uint8_t {
 struct StateImageSelectors {
     std::int32_t source      = -1;
     std::int32_t destination = -1;
+};
+
+class StateImageSourcePin {
+public:
+    StateImageSourcePin() noexcept = default;
+    ~StateImageSourcePin();
+    StateImageSourcePin(StateImageSourcePin&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)), handle_(other.handle_) {}
+    StateImageSourcePin& operator=(StateImageSourcePin&&) = delete;
+    StateImageSourcePin(const StateImageSourcePin&) = delete;
+    StateImageSourcePin& operator=(const StateImageSourcePin&) = delete;
+    [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+    [[nodiscard]] StateImageHandle handle() const noexcept { return handle_; }
+    bool release() noexcept;
+
+private:
+    friend class StateImageStore;
+    StateImageSourcePin(StateImageStore& owner, StateImageHandle handle) noexcept
+        : owner_(&owner), handle_(handle) {}
+    StateImageStore* owner_ = nullptr;
+    StateImageHandle handle_;
 };
 
 class StateImageTransfer {
@@ -93,6 +116,8 @@ private:
 // Program-private logical StateImage ownership. Logical identity is independent from Device and
 // Host replicas; published raw Tensor views are reconstructed only from an active Device binding.
 class StateImageStore {
+    friend class StateImageSourcePin;
+
 public:
     StateImageStore(qwen3_6::StateImageDevicePool& device, qwen3_6::HostStatePool* host,
                     std::uint32_t logical_capacity)
@@ -179,6 +204,7 @@ public:
                objects_[handle.index_].role != StateImageRole::Free &&
                objects_[handle.index_].generation == handle.generation_;
     }
+
 
     [[nodiscard]] std::uint32_t descriptor_index(StateImageHandle handle) const {
         (void)require(handle);
@@ -298,6 +324,22 @@ public:
         source_object.device_slot.reset();
     }
 
+    // Candidate-only immutable pin: unlike freeze(), this preserves the committed content epoch.
+    // The handle ceases to be an active writer until the pin is released or the fork is settled.
+    [[nodiscard]] StateImageSourcePin pin_candidate_source(StateImageHandle handle) {
+        Object& object = require(handle);
+        if ((object.role != StateImageRole::ActiveMutable &&
+             object.role != StateImageRole::CheckpointImmutable) || !object.device_slot ||
+            object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
+            throw std::logic_error("StateImage source cannot be candidate-pinned");
+        }
+        if (object.role == StateImageRole::ActiveMutable) {
+            object.role = StateImageRole::CandidateSourcePinned;
+        }
+        ++object.source_pins;
+        return StateImageSourcePin(*this, handle);
+    }
+
     void freeze(StateImageHandle handle) {
         Object& object = require(handle);
         if (object.role != StateImageRole::ActiveMutable || !object.device_slot ||
@@ -354,7 +396,9 @@ public:
                                                  StateImageHandle destination) {
         Object& source_object      = require(source);
         Object& destination_object = require(destination);
-        if (source == destination || source_object.role != StateImageRole::CheckpointImmutable ||
+        if (source == destination ||
+            (source_object.role != StateImageRole::CheckpointImmutable &&
+             source_object.role != StateImageRole::CandidateSourcePinned) ||
             !source_object.device_slot ||
             source_object.source_pins == std::numeric_limits<std::uint32_t>::max() ||
             destination_object.role != StateImageRole::ReservedDestination ||
@@ -373,7 +417,8 @@ public:
     void commit_fork(StateImageHandle source, StateImageHandle destination) {
         Object& source_object      = require(source);
         Object& destination_object = require(destination);
-        if (source_object.role != StateImageRole::CheckpointImmutable ||
+        if ((source_object.role != StateImageRole::CheckpointImmutable &&
+             source_object.role != StateImageRole::CandidateSourcePinned) ||
             source_object.source_pins == 0 ||
             destination_object.role != StateImageRole::ActiveMutable ||
             !destination_object.device_slot || !destination_object.destination_pinned) {
@@ -381,6 +426,32 @@ public:
         }
         --source_object.source_pins;
         destination_object.destination_pinned = false;
+    }
+
+    // Seals writes to a private fork destination and assigns the next store-authoritative
+    // content epoch. The committed source is only read here and is never version-mutated.
+    [[nodiscard]] std::uint64_t finalize_candidate_state(StateImageHandle source,
+                                                         StateImageHandle destination) {
+        const Object& source_object = require(source);
+        Object& destination_object = require(destination);
+        if (source == destination ||
+            (source_object.role != StateImageRole::CheckpointImmutable &&
+             source_object.role != StateImageRole::CandidateSourcePinned) ||
+            source_object.source_pins == 0 || !source_object.device_slot ||
+            destination_object.role != StateImageRole::ActiveMutable ||
+            !destination_object.device_slot || !destination_object.destination_pinned ||
+            destination_object.source_pins != 0 || has_pending_replica(destination_object) ||
+            destination_object.content_epoch != source_object.content_epoch) {
+            throw std::logic_error("StateImage candidate is not finalizable");
+        }
+        destination_object.content_epoch = next_epoch();
+        return destination_object.content_epoch;
+    }
+
+    // Settles only the private candidate binding; the source pin held by the candidate owner
+    // continues to protect old committed contents until descriptor publication.
+    void prepare_fork_candidate(StateImageHandle source, StateImageHandle destination) {
+        commit_fork(source, destination);
     }
 
     void abort_fork(StateImageHandle source, StateImageHandle destination) {
@@ -400,7 +471,9 @@ public:
         if (!valid(source) || !valid(destination)) { return false; }
         const Object& source_object      = objects_[source.index_];
         const Object& destination_object = objects_[destination.index_];
-        return source != destination && source_object.role == StateImageRole::CheckpointImmutable &&
+        return source != destination &&
+               (source_object.role == StateImageRole::CheckpointImmutable ||
+                source_object.role == StateImageRole::CandidateSourcePinned) &&
                source_object.source_pins != 0 &&
                destination_object.role == StateImageRole::ActiveMutable &&
                destination_object.device_slot.has_value() && destination_object.destination_pinned;
@@ -449,10 +522,12 @@ public:
         if (!source_object.device_slot || !destination_object.device_slot ||
             (inplace && (source_object.role != StateImageRole::ActiveMutable ||
                          source_object.source_pins != 0 || source_object.destination_pinned)) ||
-            (!inplace && (source_object.role != StateImageRole::CheckpointImmutable ||
-                          source_object.source_pins == 0 ||
-                          destination_object.role != StateImageRole::ActiveMutable ||
-                          !destination_object.destination_pinned))) {
+            (!inplace &&
+             ((source_object.role != StateImageRole::CheckpointImmutable &&
+               source_object.role != StateImageRole::CandidateSourcePinned) ||
+              source_object.source_pins == 0 ||
+              destination_object.role != StateImageRole::ActiveMutable ||
+              !destination_object.destination_pinned))) {
             throw std::logic_error("StateImage execution binding is invalid");
         }
         return {.source      = *source_object.device_slot,
@@ -733,6 +808,17 @@ private:
         return next_transfer_id_;
     }
 
+    bool release_source_pin(StateImageHandle handle) noexcept {
+        if (!valid(handle)) { return false; }
+        Object& object = objects_[handle.index_];
+        if (object.source_pins == 0 || has_pending_replica(object)) { return false; }
+        --object.source_pins;
+        if (object.role == StateImageRole::CandidateSourcePinned && object.source_pins == 0) {
+            object.role = StateImageRole::ActiveMutable;
+        }
+        return true;
+    }
+
     [[nodiscard]] Object& require(StateImageHandle handle) {
         if (!valid(handle)) { throw std::invalid_argument("StateImage handle is stale"); }
         return objects_[handle.index_];
@@ -773,6 +859,16 @@ private:
     std::uint64_t next_content_epoch_ = 0;
     std::uint64_t next_transfer_id_   = 0;
 };
+
+inline StateImageSourcePin::~StateImageSourcePin() {
+    if (owner_ != nullptr) { (void)release(); }
+}
+
+inline bool StateImageSourcePin::release() noexcept {
+    if (owner_ == nullptr) { return false; }
+    StateImageStore* owner = std::exchange(owner_, nullptr);
+    return owner->release_source_pin(handle_);
+}
 
 inline StateImageTransfer::~StateImageTransfer() {
     if (owner_ != nullptr) { owner_->abort_transfer(std::move(*this)); }

@@ -30,7 +30,12 @@ constexpr std::array<std::byte, 8> kMagic = {
     std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{2},
 };
 constexpr std::uint64_t kPrefixBytes      = 16;
+constexpr std::uint64_t kV3PrefixBytes    = 32;
 constexpr std::uint64_t kPayloadAlignment = 4096;
+constexpr std::array<std::byte, 8> kV3Magic = {
+    std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
+    std::byte{'E'}, std::byte{'R'}, std::byte{0}, std::byte{3},
+};
 
 std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, std::string_view label) {
     if (b > std::numeric_limits<std::uint64_t>::max() - a) {
@@ -84,23 +89,25 @@ std::uint64_t require_unsigned(const Json& value, std::string_view label, bool p
 }
 
 NumericFormat parse_format(std::string_view name) {
-    if (name == "BF16") { return NumericFormat::BF16; }
-    if (name == "FP32") { return NumericFormat::FP32; }
-    if (name == "I32") { return NumericFormat::I32; }
+    if (name == "BF16" || name == "bf16") { return NumericFormat::BF16; }
+    if (name == "FP32" || name == "fp32") { return NumericFormat::FP32; }
+    if (name == "I32" || name == "int32") { return NumericFormat::I32; }
     if (name == "Q4G64_F16S") { return NumericFormat::Q4G64_F16S; }
     if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    if (name == "gptq_q4_g128_fp16") { return NumericFormat::GPTQ_Q4_G128_FP16; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
 StorageLayout parse_layout(std::string_view name) {
-    if (name == "contiguous-le-v1") { return StorageLayout::ContiguousLeV1; }
+    if (name == "contiguous-le-v1" || name == "contiguous_le_v1") { return StorageLayout::ContiguousLeV1; }
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
+    if (name == "gptq_canonical_k128_v1") { return StorageLayout::GPTQ_CANONICAL_K128_V1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -268,10 +275,45 @@ std::uint64_t object_bytes(const ObjectDescriptor& object) noexcept {
 struct Reader::Impl {
     explicit Impl(const std::filesystem::path& path) : file(path) {
         if (file.size() < kPrefixBytes) {
-            throw ArtifactError("artifact is shorter than the v2 prefix");
+            throw ArtifactError("artifact is shorter than the version prefix");
         }
-        if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
-            throw ArtifactError("artifact magic is not NInfer v2");
+        const bool is_v2 = std::equal(kMagic.begin(), kMagic.end(), file.data());
+        const bool is_v3 = file.size() >= kV3PrefixBytes && std::equal(kV3Magic.begin(), kV3Magic.end(), file.data());
+        if (!is_v2 && !is_v3) throw ArtifactError("artifact magic/version is unsupported");
+        if (is_v3) {
+            const auto json_bytes = read_u64_le(file.data() + 8);
+            if (json_bytes == 0) throw ArtifactError("v3 json_bytes must be positive");
+            const auto metadata_end = checked_add(kV3PrefixBytes, json_bytes, "v3 JSON range");
+            payload_start = align_up(metadata_end, kPayloadAlignment, "v3 payload offset");
+            if (metadata_end > file.size() || payload_start > file.size()) throw ArtifactError("v3 JSON or payload start extends beyond file");
+            Json directory;
+            try { const auto* begin = reinterpret_cast<const char*>(file.data()+kV3PrefixBytes); directory=Json::parse(begin, begin+json_bytes); }
+            catch (const Json::exception& error) { throw ArtifactError(std::string("invalid v3 JSON directory: ")+error.what()); }
+            if (!directory.is_object() || !directory.contains("components") || !directory.contains("objects") || !directory.contains("bindings") || !directory.contains("uses") || !directory.contains("files")) throw ArtifactError("v3 directory missing required root member");
+            if (!directory["components"].is_object() || !directory["components"].contains("text") || !directory["components"]["text"].contains("config")) throw ArtifactError("v3 components.text.config is required");
+            if (!directory["objects"].is_array() || directory["objects"].empty()) throw ArtifactError("v3 objects must be a nonempty array");
+            if (!directory["files"].is_array() || directory["files"].empty()) throw ArtifactError("v3 files must be a nonempty array");
+            std::uint64_t declared_logical_bytes=0; std::size_t part_index=0;
+            for (const auto& part:directory["files"]) {
+                if (!part.is_object() || !part.contains("path") || !part.at("path").is_null() || !part.contains("payload_bytes") || !part.at("payload_bytes").is_number_unsigned() || part.at("payload_bytes").get<std::uint64_t>()==0) throw ArtifactError("invalid v3 files entry");
+                if (part.contains("part_index") && (!part.at("part_index").is_number_unsigned() || part.at("part_index").get<std::size_t>()!=part_index)) throw ArtifactError("invalid v3 part_index");
+                declared_logical_bytes=checked_add(declared_logical_bytes,part.at("payload_bytes").get<std::uint64_t>(),"v3 logical payload"); ++part_index;
+            }
+            v3_directory = directory;
+            const auto& config=directory["components"]["text"]["config"];
+            identity.model_id=config.value("model_type", "v3-text");
+            identity.weights_id="v3";
+            entries.reserve(directory["objects"].size()); index.reserve(directory["objects"].size());
+            const auto payload_bytes=static_cast<std::uint64_t>(file.size())-payload_start; if (declared_logical_bytes > payload_bytes) throw ArtifactError("v3 files payload exceeds entry file"); std::uint64_t cursor=0;
+            for (const auto& raw_object:directory["objects"]) {
+                auto object=parse_object(raw_object); const auto name=object_name(object); const auto offset=object_offset(object); const auto bytes=object_bytes(object);
+                const auto alignment=std::visit([](const auto& d){using D=std::decay_t<decltype(d)>; if constexpr(std::is_same_v<D,TensorDescriptor>) return tensor_alignment(d.layout); else return resource_alignment(d.encoding);},object);
+                if (offset<cursor || offset%alignment!=0) throw ArtifactError("v3 object overlap or alignment error");
+                const auto end=checked_add(offset,bytes,"v3 object range"); if(end>payload_bytes) throw ArtifactError("v3 object extends beyond logical payload");
+                if(!index.emplace(std::string(name),entries.size()).second) throw ArtifactError("duplicate v3 object name: "+std::string(name));
+                entries.push_back(std::move(object)); cursor=end;
+            }
+            return;
         }
 
         const auto json_bytes = read_u64_le(file.data() + 8);
@@ -344,6 +386,7 @@ struct Reader::Impl {
 
     MappedFile file;
     ArtifactIdentity identity;
+    Json v3_directory = Json::object();
     std::vector<ObjectDescriptor> entries;
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::uint64_t payload_start = 0;
@@ -356,6 +399,8 @@ Reader::Reader(Reader&&) noexcept            = default;
 Reader& Reader::operator=(Reader&&) noexcept = default;
 
 const ArtifactIdentity& Reader::identity() const noexcept { return impl_->identity; }
+
+const nlohmann::json& Reader::v3_directory() const noexcept { return impl_->v3_directory; }
 
 const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
 

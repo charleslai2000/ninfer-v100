@@ -1,3 +1,15 @@
+if(NINFER_BUILD_F6C2B_TEST)
+  add_executable(ninfer_f6c2b_ssd_scan_test artifact/f6c2b_ssd_scan.cpp)
+  target_include_directories(ninfer_f6c2b_ssd_scan_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(ninfer_f6c2b_ssd_scan_test PRIVATE ninfer_falcon_mamba_ssd CUDA::cudart)
+  return()
+endif()
+if(NINFER_BUILD_F6C2C_TEST)
+  add_executable(ninfer_f6c2c_prefill_v100_test artifact/f6c2c_prefill_v100.cpp)
+  target_include_directories(ninfer_f6c2c_prefill_v100_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+  target_link_libraries(ninfer_f6c2c_prefill_v100_test PRIVATE ninfer_falcon_h1_binder ninfer_falcon_mamba_ssd ninfer_artifact CUDA::cudart CUDA::cuda_driver)
+  return()
+endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
@@ -58,9 +70,32 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
-ninfer_add_test(ninfer_media_decode_test
-  SOURCES test_media_decode.cpp
-  LIBRARIES ninfer_media_decode)
+add_executable(ninfer_f6a_falcon_materialization_test artifact/f6a_falcon_materialization.cpp)
+target_include_directories(ninfer_f6a_falcon_materialization_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_f6a_falcon_materialization_test PRIVATE ninfer_falcon_h1_binder ninfer_artifact CUDA::cudart CUDA::cuda_driver)
+add_executable(ninfer_f6a_falcon_binder_negative_test artifact/f6a_falcon_binder_negative.cpp)
+target_include_directories(ninfer_f6a_falcon_binder_negative_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_f6a_falcon_binder_negative_test PRIVATE ninfer_falcon_h1_binder ninfer_artifact CUDA::cudart CUDA::cuda_driver)
+add_executable(ninfer_f6b_gptq_v100_test artifact/f6b_gptq_v100.cpp)
+target_include_directories(ninfer_f6b_gptq_v100_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_f6b_gptq_v100_test PRIVATE ninfer_falcon_h1_binder ninfer_artifact ninfer_gptq_g128 CUDA::cudart CUDA::cuda_driver)
+add_executable(ninfer_f6b_gptq_forensic_test artifact/f6b_gptq_forensic.cpp)
+target_include_directories(ninfer_f6b_gptq_forensic_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_f6b_gptq_forensic_test PRIVATE ninfer_falcon_h1_binder ninfer_artifact ninfer_gptq_g128 CUDA::cudart CUDA::cuda_driver)
+add_executable(ninfer_f6b_authoritative_reproducer_test artifact/f6b_authoritative_reproducer.cpp)
+target_include_directories(ninfer_f6b_authoritative_reproducer_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_f6b_authoritative_reproducer_test PRIVATE ninfer_falcon_h1_binder ninfer_artifact ninfer_gptq_g128 CUDA::cudart CUDA::cuda_driver)
+add_executable(ninfer_f6c1_mamba_v100_test artifact/f6c1_mamba_v100.cpp)
+target_include_directories(ninfer_f6c1_mamba_v100_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_f6c1_mamba_v100_test PRIVATE ninfer_falcon_h1_binder ninfer_artifact CUDA::cudart CUDA::cuda_driver)
+add_executable(ninfer_f6c2c_prefill_v100_test artifact/f6c2c_prefill_v100.cpp)
+target_include_directories(ninfer_f6c2c_prefill_v100_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_f6c2c_prefill_v100_test PRIVATE ninfer_falcon_h1_binder ninfer_falcon_mamba_ssd ninfer_artifact CUDA::cudart CUDA::cuda_driver)
+if(NINFER_BUILD_MEDIA_DECODE)
+  ninfer_add_test(ninfer_media_decode_test
+    SOURCES test_media_decode.cpp
+    LIBRARIES ninfer_media_decode)
+endif()
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
@@ -109,6 +144,18 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_falcon_h1_program_test
+  SOURCES targets/test_falcon_h1_program.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_falcon_h1_program_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_falcon_h1_program_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_candidate_continuation_test
+  SOURCES targets/qwen3_6/test_candidate_continuation.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_candidate_continuation_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_candidate_continuation_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)

@@ -94,6 +94,33 @@ private:
     friend class KVAddressSpaceStore;
 };
 
+class KVRollbackActivationLease {
+public:
+    KVRollbackActivationLease() noexcept = default;
+    KVRollbackActivationLease(KVRollbackActivationLease&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)), address_(other.address_),
+          entitlement_(other.entitlement_), frontier_(other.frontier_),
+          page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)) {}
+    KVRollbackActivationLease& operator=(KVRollbackActivationLease&&) = delete;
+    KVRollbackActivationLease(const KVRollbackActivationLease&) = delete;
+    KVRollbackActivationLease& operator=(const KVRollbackActivationLease&) = delete;
+    [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+private:
+    KVRollbackActivationLease(KVAddressSpaceStore& owner, KVAddressSpaceHandle address,
+                              std::uint32_t entitlement, std::uint32_t frontier,
+                              DeviceKVPageReservation&& reservation,
+                              KVExecutionRowLease&& row) noexcept
+        : owner_(&owner), address_(address), entitlement_(entitlement), frontier_(frontier),
+          page_reservation_(std::move(reservation)), row_(std::move(row)) {}
+    KVAddressSpaceStore* owner_ = nullptr;
+    KVAddressSpaceHandle address_;
+    std::uint32_t entitlement_ = 0;
+    std::uint32_t frontier_ = 0;
+    DeviceKVPageReservation page_reservation_;
+    std::optional<KVExecutionRowLease> row_;
+    friend class KVAddressSpaceStore;
+};
+
 class KVActivationReservation {
 public:
     KVActivationReservation() noexcept = default;
@@ -859,6 +886,8 @@ public:
     }
 
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
+    [[nodiscard]] DeviceKVPagePool& physical_pool() noexcept { return pages_->physical_pool(); }
+    [[nodiscard]] const DeviceKVPagePool& physical_pool() const noexcept { return pages_->physical_pool(); }
 
     [[nodiscard]] std::optional<KVAddressSpaceHandle> create_active(std::uint32_t entitlement,
                                                                     std::int32_t execution_row) {
@@ -998,6 +1027,89 @@ public:
             pages_->retain_active_reference(logical);
         }
         publish_membership(address, stream);
+    }
+
+    [[nodiscard]] KVRollbackActivationLease
+    deactivate_with_rollback_lease(KVAddressSpaceHandle handle) {
+        Address& address = require_active(handle);
+        const std::uint32_t held_entitlement = entitlement(address);
+        const std::uint32_t held_frontier = address.committed_frontier;
+        if (!address.row || !address.reservation.valid()) {
+            throw std::logic_error("KV rollback source lost activation resources");
+        }
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (pages_->writer_references(logical) != 0 &&
+                !pages_->can_set_writer(logical, false)) {
+                throw std::logic_error("KV rollback deactivation has an invalid writer reference");
+            }
+        }
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (pages_->writer_references(logical) != 0) { pages_->set_writer(logical, false); }
+            pages_->release_active_reference(logical);
+        }
+        KVExecutionRowLease row = std::move(*address.row);
+        address.row.reset();
+        DeviceKVPageReservation reservation = std::move(address.reservation);
+        address.active = false;
+        return KVRollbackActivationLease(*this, handle, held_entitlement, held_frontier,
+                                         std::move(reservation), std::move(row));
+    }
+
+    void restore_with_rollback_lease(KVRollbackActivationLease&& lease,
+                                     cudaStream_t stream = nullptr) {
+        if (lease.owner_ != this || !lease.row_ || !valid(lease.address_)) {
+            throw std::logic_error("KV rollback activation lease is stale");
+        }
+        Address& address = require(lease.address_);
+        if (address.active || address.row || address.reservation.valid() ||
+            address.committed_frontier != lease.frontier_ ||
+            lease.entitlement_ < address.page_count ||
+            lease.page_reservation_.pages() != lease.entitlement_ - address.page_count) {
+            throw std::logic_error("KV rollback destination changed while quiesced");
+        }
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (!pages_->device_resident(logical) ||
+                (pages_->address_references(logical) == 1 && !pages_->can_set_writer(logical, true))) {
+                throw std::logic_error("KV rollback source page is unavailable");
+            }
+        }
+        address.reservation = std::move(lease.page_reservation_);
+        address.row.emplace(std::move(*lease.row_));
+        lease.row_.reset();
+        address.active = true;
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (pages_->address_references(logical) == 1) {
+                pages_->clear_protection(logical);
+                pages_->set_writer(logical, true);
+            }
+            pages_->retain_active_reference(logical);
+        }
+        publish_membership(address, stream);
+        lease.owner_ = nullptr;
+    }
+
+    [[nodiscard]] KVRollbackActivationLease
+    prepare_rollback_activation(KVAddressSpaceHandle handle, std::uint32_t entitlement_pages,
+                                std::int32_t execution_row) {
+        Address& address = require_active(handle);
+        if (entitlement_pages < address.page_count || entitlement_pages > page_capacity_) {
+            throw std::invalid_argument("KV rollback entitlement is invalid");
+        }
+        DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
+        pages_->physical_pool().resize_reservation(reservation, entitlement_pages - address.page_count);
+        KVExecutionRowLease row = tables_->acquire(execution_row);
+        return KVRollbackActivationLease(*this, handle, entitlement_pages,
+                                         address.committed_frontier, std::move(reservation),
+                                         std::move(row));
+    }
+
+    void prepare_prefix_fork_candidate(KVPrefixForkReservation&& fork,
+                                       cudaStream_t stream = nullptr) {
+        commit_prefix_fork(std::move(fork), stream);
     }
 
     void deactivate(KVAddressSpaceHandle handle) {
@@ -1633,6 +1745,11 @@ public:
 
     [[nodiscard]] std::uint32_t entitlement(KVAddressSpaceHandle handle) const {
         return entitlement(require(handle));
+    }
+
+    [[nodiscard]] std::uint32_t growth_reservation(KVAddressSpaceHandle handle) const {
+        const Address& address = require(handle);
+        return address.reservation.valid() ? address.reservation.pages() : 0U;
     }
 
     [[nodiscard]] std::uint32_t committed_frontier(KVAddressSpaceHandle handle) const {

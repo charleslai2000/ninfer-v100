@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,7 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    GPTQ_Q4_G128_FP16,
 };
 
 enum class StorageLayout {
@@ -35,6 +37,7 @@ enum class StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    GPTQ_CANONICAL_K128_V1,
 };
 
 enum class ResourceEncoding {
@@ -140,6 +143,7 @@ public:
     Reader& operator=(const Reader&) = delete;
 
     const ArtifactIdentity& identity() const noexcept;
+    const nlohmann::json& v3_directory() const noexcept;
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
 
