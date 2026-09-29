@@ -97,6 +97,7 @@ public:
     ContinuationCandidate& operator=(const ContinuationCandidate&) = delete;
 
     [[nodiscard]] ContinuationCandidateViews views() const;
+    [[nodiscard]] ContinuationOwner::KVStore& kv_store_for_execution() const;
     void execute(const std::function<void(ContinuationCandidateViews)>& work);
     void prepare();
     void commit();

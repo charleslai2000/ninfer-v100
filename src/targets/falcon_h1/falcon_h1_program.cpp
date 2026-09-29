@@ -1,4 +1,5 @@
 #include "falcon_h1_program.h"
+#include "falcon_h1_attention.h"
 
 #include <algorithm>
 #include <limits>
@@ -97,6 +98,47 @@ Program::~Program() {
     }
 }
 
+std::size_t Program::attention_workspace_bytes(std::size_t tokens) const {
+    return ::ninfer::targets::falcon_h1::attention_workspace_bytes(tokens);
+}
+
+std::size_t Program::configure_attention_kv_storage(LayoutBuilder& layout,
+                                                       std::uint32_t physical_page_count) const {
+    if (physical_page_count == 0) throw std::invalid_argument("Falcon KV page count is zero");
+    const auto schema = paged_kv_storage_layout(KvCacheStorage::BFloat16, static_cast<std::int32_t>(geometry_.head_dim));
+    auto pool = plan_device_kv_page_pool(layout, DeviceKVPagePoolSpec{
+        .page_group_count=physical_page_count,
+        .geometry={.page_tokens=kPagedKVPageSize,
+                   .device_plane_order=PagedKVPlaneOrder::PageMajor,
+                   .planes={{.dtype=schema.key.data_dtype,.leading_extent=schema.key.data_leading_extent,
+                             .head_extent=static_cast<std::int32_t>(geometry_.kv_heads)},
+                            {.dtype=schema.value.data_dtype,.leading_extent=schema.value.data_leading_extent,
+                             .head_extent=static_cast<std::int32_t>(geometry_.kv_heads)}}}});
+    return pool.payload_bytes();
+}
+
+void Program::run_attention(std::uint64_t sequence_id, std::uint32_t layer,
+                             const BoundModel& model,
+                             const artifact::MaterializedArtifact& materialized,
+                             const Tensor& input, Tensor& output, DeviceSpan workspace,
+                             std::size_t workspace_bytes, cudaStream_t stream) {
+    auto& owner = sequence(sequence_id);
+    const ContinuationDescriptor base = owner.snapshot();
+    const auto tokens = static_cast<std::uint64_t>(input.ne[1]);
+    if (tokens == 0 || base.position != base.kv_frontier ||
+        tokens > geometry_.context_limit - base.position ||
+        base.recurrent_version == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::invalid_argument("Falcon Program Attention continuation extent is invalid");
+    }
+    auto candidate = owner.begin({.kv_frontier=base.kv_frontier+tokens,
+                                  .position=base.position+tokens,
+                                  .recurrent_version=base.recurrent_version+1});
+    execute_attention(*this, candidate, base, base.position, layer, model, materialized,
+                      input, output, workspace, workspace_bytes, stream);
+    candidate.prepare();
+    candidate.commit();
+}
+
 std::uint64_t Program::create_sequence(std::int32_t row) {
     if(sequences_.size()>=sequence_capacity_ || row<0 || row>=row_count_)
         throw std::runtime_error("Falcon sequence capacity/row unavailable");
@@ -133,6 +175,9 @@ const ContinuationOwner& Program::sequence(std::uint64_t id) const {
     const auto it=std::find_if(sequences_.begin(),sequences_.end(),[&](const auto& s){return s->id==id;});
     if(it==sequences_.end()) throw std::out_of_range("Falcon sequence id is stale");
     return *(*it)->owner;
+}
+void Program::set_failure_injection_for_test(std::uint64_t id, std::int32_t stage) {
+    sequence(id).set_failure_injection_for_test(stage);
 }
 FalconContinuationSnapshot Program::fork_snapshot(std::uint64_t id) const {
     return {sequence(id).snapshot()};

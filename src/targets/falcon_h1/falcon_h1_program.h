@@ -1,7 +1,10 @@
 #pragma once
 
 #include "falcon_h1_binder.h"
+#include "artifact/materializer.h"
+#include "core/arena.h"
 #include "core/candidate_continuation.h"
+#include <cuda_runtime_api.h>
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
 #include <cstdint>
@@ -37,9 +40,19 @@ public:
     [[nodiscard]] const ModelGeometry& geometry() const noexcept { return geometry_; }
     [[nodiscard]] const std::vector<LayerDispatchSlots>& layers() const noexcept { return layers_; }
     [[nodiscard]] std::size_t sequence_count() const noexcept { return sequences_.size(); }
+    [[nodiscard]] KVStore& kv_store() noexcept { return *kv_; }
+    [[nodiscard]] const KVStore& kv_store() const noexcept { return *kv_; }
+    [[nodiscard]] const KVPageGeometry& kv_geometry() const noexcept { return kv_->physical_geometry(); }
+    [[nodiscard]] std::size_t attention_workspace_bytes(std::size_t tokens) const;
+    [[nodiscard]] std::size_t configure_attention_kv_storage(LayoutBuilder& layout,
+                                                              std::uint32_t physical_page_count) const;
+    void run_attention(std::uint64_t sequence_id, std::uint32_t layer, const BoundModel&,
+                       const artifact::MaterializedArtifact&, const Tensor& input, Tensor& output,
+                       DeviceSpan workspace, std::size_t workspace_bytes, cudaStream_t stream);
     [[nodiscard]] std::uint64_t create_sequence(std::int32_t row);
     [[nodiscard]] ContinuationOwner& sequence(std::uint64_t id);
     [[nodiscard]] const ContinuationOwner& sequence(std::uint64_t id) const;
+    void set_failure_injection_for_test(std::uint64_t id, std::int32_t stage);
     [[nodiscard]] FalconContinuationSnapshot fork_snapshot(std::uint64_t id) const;
     void reset_sequence(std::uint64_t id, std::int32_t row);
     void release_sequence(std::uint64_t id);

@@ -92,6 +92,7 @@ private:
     std::uint32_t generation_         = 0;
 
     friend class KVAddressSpaceStore;
+    friend class ContinuationCandidate;
 };
 
 class KVRollbackActivationLease {
@@ -888,6 +889,7 @@ public:
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
     [[nodiscard]] DeviceKVPagePool& physical_pool() noexcept { return pages_->physical_pool(); }
     [[nodiscard]] const DeviceKVPagePool& physical_pool() const noexcept { return pages_->physical_pool(); }
+    [[nodiscard]] const KVPageGeometry& physical_geometry() const noexcept { return pages_->physical_pool().geometry(); }
 
     [[nodiscard]] std::optional<KVAddressSpaceHandle> create_active(std::uint32_t entitlement,
                                                                     std::int32_t execution_row) {
@@ -1772,6 +1774,34 @@ public:
         }
         return *address.row;
     }
+
+    [[nodiscard]] std::int32_t logical_page_capacity() const noexcept { return static_cast<std::int32_t>(page_capacity_); }
+    [[nodiscard]] std::int32_t physical_page_capacity() const noexcept { return static_cast<std::int32_t>(pages_->physical_pool().capacity_pages()); }
+    [[nodiscard]] std::int32_t execution_row_index(KVAddressSpaceHandle handle) const { return execution_row(handle).row_index(); }
+    [[nodiscard]] std::uint32_t visible_frontier(KVAddressSpaceHandle handle) const { return require_active(handle).committed_frontier; }
+
+    [[nodiscard]] PagedKVLayerView execution_layer_view(KVAddressSpaceHandle handle,
+                                                         std::uint32_t layer,
+                                                         std::int32_t head_dim,
+                                                         std::int32_t kv_heads,
+                                                         KvCacheStorage storage,
+                                                         PagedKVPlaneOrder expected_order = PagedKVPlaneOrder::PageMajor) const {
+        const auto& row_lease = execution_row(handle);
+        const auto& geometry = pages_->physical_pool().geometry();
+        const PagedKVStorageLayout layout = paged_kv_storage_layout(storage, head_dim);
+        const std::size_t stride = layout.planes_per_layer();
+        if (geometry.page_tokens != kPagedKVPageSize || geometry.device_plane_order != expected_order ||
+            geometry.planes.size() < (static_cast<std::size_t>(layer)+1U)*stride) {
+            throw std::invalid_argument("KV layer-view page geometry is incompatible");
+        }
+        const std::size_t base = static_cast<std::size_t>(layer)*stride;
+        const auto& kg=geometry.planes[base]; const auto& vg=geometry.planes[base+1U];
+        if(kg.dtype!=layout.key.data_dtype||vg.dtype!=layout.value.data_dtype||kg.head_extent!=kv_heads||vg.head_extent!=kv_heads||kg.leading_extent!=layout.key.data_leading_extent||vg.leading_extent!=layout.value.data_leading_extent||kv_heads<=0)
+            throw std::invalid_argument("KV layer-view plane metadata mismatch");
+        const std::size_t ks=base+2U,vs=ks+static_cast<std::size_t>(layout.key.has_scale());
+        return PagedKVLayerView{.k_pages=pages_->physical_pool().plane(base),.v_pages=pages_->physical_pool().plane(base+1U),.k_scale_pages=layout.key.has_scale()?pages_->physical_pool().plane(ks):Tensor(),.v_scale_pages=layout.value.has_scale()?pages_->physical_pool().plane(vs):Tensor(),.block_table=tables_->row(row_lease.handle()),.head_dim=head_dim,.num_kv_heads=kv_heads,.storage=storage};
+    }
+
 
     [[nodiscard]] DeviceKVPageHandle physical_page(KVAddressSpaceHandle handle,
                                                    std::uint32_t logical_page) const {

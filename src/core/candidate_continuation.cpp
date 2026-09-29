@@ -143,6 +143,10 @@ ContinuationCandidateViews ContinuationCandidate::views() const {
     const auto selectors = owner_->state_store_->selectors(state_source_, state_candidate_);
     return {kv_candidate_, selectors, state_candidate_};
 }
+ContinuationOwner::KVStore& ContinuationCandidate::kv_store_for_execution() const {
+    if (!owner_ || !prepared_ || executed_) throw std::logic_error("candidate KV view is outside execution lifetime");
+    return *owner_->kv_store_;
+}
 
 void ContinuationCandidate::execute(const std::function<void(ContinuationCandidateViews)>& work) {
     if (!owner_ || executed_ || !work) throw std::logic_error("candidate cannot execute");
@@ -165,6 +169,7 @@ void ContinuationCandidate::execute(const std::function<void(ContinuationCandida
         if (fail_during_execute_for_test_ == 5)
             throw std::runtime_error("injected after candidate KV write");
         work(candidate_views);
+        if (!owner_->kv_store_->valid(kv_candidate_)) throw std::logic_error("candidate KV handle changed during execution");
         if (fail_during_execute_for_test_ == 6)
             throw std::runtime_error("injected after candidate state write");
         finalized_state_version_ = owner_->state_store_->finalize_candidate_state(

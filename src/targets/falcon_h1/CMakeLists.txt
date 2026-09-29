@@ -1,6 +1,6 @@
-add_library(ninfer_falcon_h1_binder STATIC falcon_h1_binder.cpp falcon_h1_mamba.cu)
+add_library(ninfer_falcon_h1_binder STATIC falcon_h1_binder.cpp falcon_h1_mamba.cu falcon_h1_attention.cu)
 ninfer_internal_includes(ninfer_falcon_h1_binder)
-target_include_directories(ninfer_falcon_h1_binder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ninfer_falcon_h1_binder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_falcon_h1_binder PUBLIC ninfer_artifact ninfer_falcon_mamba_ssd)
 target_sources(ninfer_engine PRIVATE falcon_h1_program.cpp)
 target_link_libraries(ninfer_engine PRIVATE ninfer_gptq_g128)
