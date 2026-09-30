@@ -1,4 +1,5 @@
 #include "falcon_h1_binder.h"
+#include "artifact/v3_reader.h"
 
 #include <algorithm>
 #include <array>
@@ -136,7 +137,18 @@ BoundModel bind(Reader& reader) {
   if(payload.data.size()!=tensor_encoded_size(s.layout,s.fmt,s.shape)) invalid("payload size mismatch: "+s.name);
   if(s.fmt==NumericFormat::I32){const auto k=s.shape.at(0);std::vector<bool> seen(k,false);for(std::uint64_t j=0;j<k;++j){std::int32_t value=0;std::memcpy(&value,payload.data.data()+j*sizeof(value),sizeof(value));if(value<0||static_cast<std::uint64_t>(value)>=k||seen[static_cast<std::size_t>(value)])invalid("input_perm is not a permutation: "+s.name);seen[static_cast<std::size_t>(value)]=true;}}
   binder.materialize_on_device(handle);
+  if (s.fmt == NumericFormat::I32 && s.name.find("/input_perm") != std::string::npos) {
+      const std::string weight=s.name.substr(0,s.name.size()-11);
+      out.gptq_permutations.emplace(weight,GptqPermutationStage{handle,0,payload.data.size()});
+      std::vector<std::int32_t> permutation(s.shape.at(0));
+      std::memcpy(permutation.data(),payload.data.data(),payload.data.size());
+      out.gptq_host_permutations.emplace(weight,std::move(permutation));
+  }
   out.tensors.emplace(s.name,BoundTensor{handle,s.name});
+  if (s.fmt == NumericFormat::GPTQ_Q4_G128_FP16) {
+      const auto K=s.shape.at(1), N=s.shape.at(0); const auto g=artifact::v3::gptq_g128_geometry(K,N);
+      out.gptq_geometry.emplace(s.name,std::array<std::uint64_t,3>{N,K,g.groups});
+  }
   out.device_bytes_by_format[std::string(format_name(s.fmt))]+=payload.data.size();
  }
  out.materialization=binder.finish();

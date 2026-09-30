@@ -142,6 +142,9 @@ ninfer_add_test(ninfer_falcon_h1_program_test
 target_include_directories(ninfer_falcon_h1_program_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_falcon_h1_program_test PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(ninfer_stage2_hybrid_v100_test artifact/stage2_hybrid_v100.cpp)
+target_include_directories(ninfer_stage2_hybrid_v100_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_stage2_hybrid_v100_test PRIVATE ninfer_engine ninfer_falcon_h1_binder ninfer_gptq_g128 ninfer_artifact CUDA::cudart)
 ninfer_add_test(ninfer_candidate_continuation_test
   SOURCES targets/qwen3_6/test_candidate_continuation.cpp
   LIBRARIES ninfer_engine ninfer_core)

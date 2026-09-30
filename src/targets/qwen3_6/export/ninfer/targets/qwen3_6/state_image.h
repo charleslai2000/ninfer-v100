@@ -23,14 +23,29 @@ struct DFlashLocalStateSpec {
     std::int32_t head_dim  = 0;
 };
 
+struct FalconStatePayloadSpec {
+    std::uint32_t layers = 0;
+    std::uint32_t slot_count = 0;
+    std::int32_t conv_channels = 3584;
+    std::int32_t conv_width = 3;
+    std::int32_t ssm_heads = 24;
+    std::int32_t head_dim = 128;
+    std::int32_t state_dim = 256;
+};
+
 struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
     std::optional<DFlashLocalStateSpec> dflash_local;
+    std::optional<FalconStatePayloadSpec> falcon;
 };
 
 struct StateImageHostLayout {
     StateImageSpec spec;
+    std::optional<LayoutRegion> falcon_conv;
+    std::optional<LayoutRegion> falcon_ssm;
+    std::size_t falcon_conv_layer_bytes = 0;
+    std::size_t falcon_ssm_layer_bytes = 0;
     LayoutRegion linear_conv;
     std::size_t linear_conv_layer_bytes = 0;
     LayoutRegion linear_recurrent;
@@ -42,8 +57,12 @@ struct StateImageHostLayout {
     std::size_t image_bytes              = 0;
 };
 
+struct FalconStateSlotView { Tensor conv; Tensor ssm; };
+
 struct StateImageDeviceLayout {
     LinearAttentionStatePoolLayout linear;
+    std::vector<TensorRegion> falcon_conv;
+    std::vector<TensorRegion> falcon_ssm;
     TensorRegion continuation_hidden;
     std::optional<CyclicKVCacheLayout> dflash_local;
     StateImageHostLayout host;
@@ -114,6 +133,7 @@ struct StateImageDeviceSlotView {
     LinearAttentionStateSlotView linear;
     Tensor continuation_hidden;
     std::optional<CyclicKVCacheSlotView> dflash_local;
+    std::optional<FalconStateSlotView> falcon;
 };
 
 /**
@@ -135,6 +155,8 @@ public:
 
     [[nodiscard]] StateImageDeviceSlotView slot_view(std::int32_t slot) const;
     [[nodiscard]] Tensor continuation_hidden_slot(std::int32_t slot) const;
+    [[nodiscard]] std::optional<FalconStateSlotView> falcon_slot(std::uint32_t layer, std::int32_t slot) const;
+    [[nodiscard]] std::size_t falcon_layer_count() const noexcept { return static_cast<std::size_t>(falcon_conv_.size()); }
 
     [[nodiscard]] LinearAttentionStatePool& linear() noexcept { return linear_; }
 
@@ -167,6 +189,8 @@ private:
     LinearAttentionStatePool linear_;
     Tensor continuation_hidden_;
     std::optional<CyclicKVCache> dflash_local_;
+    std::vector<Tensor> falcon_conv_;
+    std::vector<Tensor> falcon_ssm_;
     StateImageHostLayout host_layout_;
 };
 

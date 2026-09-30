@@ -69,6 +69,11 @@ struct ReadSpan {
 
 } // namespace
 
+MaterializedArtifact::~MaterializedArtifact() {
+    for(auto& cleanup:device_cleanups_) cleanup.second();
+    device_cleanups_.clear();
+}
+
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
         throw ArtifactError("object handle does not name a materialized tensor");
@@ -95,6 +100,26 @@ std::vector<std::byte> MaterializedArtifact::take_resource_bytes(ObjectHandle ha
 DeviceArena& MaterializedArtifact::device_arena() {
     if (!device_arena_) { throw ArtifactError("artifact has no device tensor backing"); }
     return *device_arena_;
+}
+
+void* MaterializedArtifact::device_allocate(std::size_t bytes, std::size_t alignment) {
+    if (!device_arena_ || bytes == 0) throw ArtifactError("artifact persistent device allocation is unavailable");
+    if (!persistent_arena_) persistent_arena_=std::make_unique<DeviceArena>(64U*1024U*1024U);
+    return persistent_arena_->alloc_bytes(bytes,alignment).data;
+}
+void MaterializedArtifact::register_device_cleanup(void* owner,std::function<void()> cleanup) {
+    if(!owner||!cleanup) throw ArtifactError("invalid artifact device cleanup registration");
+    unregister_device_cleanup(owner); device_cleanups_.emplace_back(owner,std::move(cleanup));
+}
+void MaterializedArtifact::unregister_device_cleanup(void* owner) noexcept {
+    auto it=std::find_if(device_cleanups_.begin(),device_cleanups_.end(),[&](const auto& item){return item.first==owner;});
+    if(it!=device_cleanups_.end()) device_cleanups_.erase(it);
+}
+void MaterializedArtifact::reset_device_allocations() {
+    for(auto& cleanup:device_cleanups_) cleanup.second();
+    device_cleanups_.clear();
+    persistent_arena_.reset();
+    if (++device_generation_==0) ++device_generation_;
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,

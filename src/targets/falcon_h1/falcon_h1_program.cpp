@@ -1,5 +1,8 @@
 #include "falcon_h1_program.h"
 #include "falcon_h1_attention.h"
+#include "falcon_h1_mamba.h"
+#include "falcon_h1_layer.h"
+#include "core/device.h"
 
 #include <algorithm>
 #include <limits>
@@ -52,6 +55,7 @@ ModelGeometry geometry_from_artifact(const BoundModel& b, std::uint64_t context_
     g.ssm_out_multiplier=scalar(b,"ssm_out_multiplier"); g.rms_norm_eps=scalar(b,"rms_norm_eps");
     g.rope_theta=scalar(b,"rope_theta"); g.ssm_multipliers=array(b,"ssm_multipliers");
     g.mlp_multipliers=array(b,"mlp_multipliers");
+    g.gate_multiplier=g.mlp_multipliers.at(0); g.down_multiplier=g.mlp_multipliers.at(1);
     g.layer_types=layer_types;
     if(g.layer_count!=b.layer_count || g.layer_count==0 || g.layer_count>std::numeric_limits<std::uint32_t>::max() ||
        g.attention_heads*g.head_dim==0 || g.kv_heads==0 || g.ssm_heads*g.ssm_head_dim!=g.hidden_size ||
@@ -80,6 +84,8 @@ Program::Program(ModelGeometry geometry, std::uint32_t kv_entitlement, std::int3
         throw std::invalid_argument("Falcon Program construction geometry/capacity is invalid");
     if(geometry_.layer_types.size()!=geometry_.layer_count)
         throw std::invalid_argument("Falcon Program requires artifact-bound layer inventory");
+    if (state_physical_->falcon_layer_count() != geometry_.layer_count)
+        throw std::invalid_argument("Falcon StateImage pool must contain exact FP32 state for every layer");
     layers_.reserve(static_cast<std::size_t>(geometry_.layer_count));
     for(std::uint32_t i=0;i<geometry_.layer_count;++i) {
         if(geometry_.layer_types[i]!="falcon_h1_hybrid")
@@ -101,6 +107,25 @@ Program::~Program() {
 std::size_t Program::attention_workspace_bytes(std::size_t tokens) const {
     return ::ninfer::targets::falcon_h1::attention_workspace_bytes(tokens);
 }
+std::size_t Program::hybrid_workspace_bytes(std::size_t tokens) const { return ::ninfer::targets::falcon_h1::layer_workspace_bytes(tokens); }
+std::int32_t Program::state_physical_slot(qwen_store::StateImageHandle handle) const { return states_->physical_slot(handle); }
+std::uint32_t Program::kv_frontier(std::uint64_t sequence_id) const {const auto& owner=sequence(sequence_id);return kv_->committed_frontier(owner.active_kv_handle());}
+std::uint64_t Program::active_kv_identity(std::uint64_t sequence_id) const {return kv_->identity(sequence(sequence_id).active_kv_handle());}
+void Program::copy_candidate_state(const qwen_store::StateImageSelectors& selectors,cudaStream_t stream) const { state_physical_->copy_slot(selectors.source,selectors.destination,stream); }
+std::uint32_t Program::candidate_row(std::uint64_t sequence_id) const { const auto it=std::find_if(sequences_.begin(),sequences_.end(),[&](const auto&s){return s->id==sequence_id;});if(it==sequences_.end())throw std::out_of_range("Falcon sequence id is stale");return static_cast<std::uint32_t>((*it)->owner->snapshot().generation); }
+void Program::stage_gptq(const BoundModel& model,artifact::MaterializedArtifact& mat,GptqExecution& execution) const { execution.stage(model,mat); }
+void Program::reset_gptq(GptqExecution& execution,artifact::MaterializedArtifact& mat) const noexcept { execution.reset(); mat.reset_device_allocations(); }
+MambaDecodeStateView Program::mamba_state_view(std::uint64_t sequence_id, std::uint32_t layer) const {
+    const auto& owner = sequence(sequence_id);
+    auto view = state_physical_->falcon_slot(layer, states_->physical_slot(owner.active_state_handle()));
+    if (!view) throw std::logic_error("Falcon exact state payload is not configured");
+    return {static_cast<float*>(view->conv.data), static_cast<float*>(view->ssm.data)};
+}
+MambaDecodeStateView Program::mamba_candidate_state_view(const qwen_store::StateImageSelectors& sel, std::uint32_t layer) const {
+    auto view=state_physical_->falcon_slot(layer,sel.destination);
+    if(!view) throw std::logic_error("Falcon exact candidate state payload is not configured");
+    return {static_cast<float*>(view->conv.data),static_cast<float*>(view->ssm.data)};
+}
 
 std::size_t Program::configure_attention_kv_storage(LayoutBuilder& layout,
                                                        std::uint32_t physical_page_count) const {
@@ -117,6 +142,12 @@ std::size_t Program::configure_attention_kv_storage(LayoutBuilder& layout,
     return pool.payload_bytes();
 }
 
+void Program::execute_layer(std::uint64_t sequence_id, std::uint32_t layer,const BoundModel& model,const artifact::MaterializedArtifact& mat,GptqExecution& gptq,const Tensor& input,Tensor& output,DeviceSpan workspace,std::size_t workspace_bytes,cudaStream_t stream){
+    ::ninfer::targets::falcon_h1::execute_layer(*this,sequence_id,layer,model,mat,gptq,input,output,workspace,workspace_bytes,stream);
+}
+void Program::run_hybrid_layer(std::uint64_t sequence_id, std::uint32_t layer,const BoundModel& model,const artifact::MaterializedArtifact& mat,GptqExecution& gptq,const Tensor& input,Tensor& output,DeviceSpan workspace,std::size_t workspace_bytes,cudaStream_t stream){
+    ::ninfer::targets::falcon_h1::execute_layer(*this,sequence_id,layer,model,mat,gptq,input,output,workspace,workspace_bytes,stream);
+}
 void Program::run_attention(std::uint64_t sequence_id, std::uint32_t layer,
                              const BoundModel& model,
                              const artifact::MaterializedArtifact& materialized,
@@ -153,6 +184,7 @@ std::uint64_t Program::create_sequence(std::int32_t row) {
     if(!state) { if(!kv_->release_after_deactivate(*kv)) std::terminate(); throw std::runtime_error("Falcon sequence recurrent state allocation failed"); }
     try {
         const auto epoch=states_->content_epoch(*state);
+        state_physical_->zero_slot(states_->physical_slot(*state),nullptr);
         const auto id=next_id_++;
         auto sequence=std::make_unique<Sequence>(); sequence->id=id; sequence->kv=*kv; sequence->state=*state;
         ContinuationDescriptor descriptor{0,0,0,0,epoch,1};
@@ -193,6 +225,7 @@ void Program::reset_sequence(std::uint64_t id,std::int32_t row) {
     slot.state=slot.owner->active_state_handle();
     if(row<0 || row>=row_count_)
         throw std::invalid_argument("Falcon reset requires a valid execution row");
+    if(kv_->committed_frontier(slot.kv)!=slot.owner->snapshot().kv_frontier)throw std::logic_error("Falcon reset detected KV/descriptor frontier mismatch");
     const auto next_state=states_->reserve_reset(nullptr);
     if(!next_state) throw std::runtime_error("Falcon reset recurrent state allocation failed");
     const auto old_kv=slot.kv;
@@ -211,6 +244,7 @@ void Program::reset_sequence(std::uint64_t id,std::int32_t row) {
         throw;
     }
     slot.kv=*next_kv; slot.state=*next_state;
+    state_physical_->zero_slot(states_->physical_slot(slot.state),nullptr);
     const auto epoch=states_->content_epoch(slot.state);
     slot.owner=std::make_unique<ContinuationOwner>(
         ContinuationDescriptor{0,0,0,0,epoch,1},slot.kv,slot.state,*kv_,*states_,
@@ -222,6 +256,7 @@ void Program::release_sequence(std::uint64_t id) {
     auto& s=**it;
     s.kv=s.owner->active_kv_handle(); s.state=s.owner->active_state_handle();
     if(s.owner->transaction_pending()) throw std::logic_error("cannot release Falcon sequence during candidate transaction");
+    if(kv_->committed_frontier(s.kv)!=s.owner->snapshot().kv_frontier)std::terminate();
     if(!kv_->release_after_deactivate(s.kv) || !states_->release(s.state)) std::terminate();
     sequences_.erase(it);
 }

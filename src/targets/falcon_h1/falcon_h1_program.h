@@ -1,6 +1,8 @@
 #pragma once
 
 #include "falcon_h1_binder.h"
+#include "falcon_h1_mamba.h"
+#include "falcon_h1_gptq.h"
 #include "artifact/materializer.h"
 #include "core/arena.h"
 #include "core/candidate_continuation.h"
@@ -22,7 +24,7 @@ struct ModelGeometry {
     std::uint64_t recurrent_value_head_dim=0, recurrent_key_head_dim=0;
     double embedding_multiplier=0, attention_in_multiplier=0, attention_out_multiplier=0;
     double key_multiplier=0, ssm_in_multiplier=0, ssm_out_multiplier=0;
-    double rms_norm_eps=0, rope_theta=0;
+    double rms_norm_eps=0, rope_theta=0, gate_multiplier=0, down_multiplier=0;
     std::vector<double> ssm_multipliers, mlp_multipliers;
     std::vector<std::string> layer_types;
 };
@@ -44,8 +46,24 @@ public:
     [[nodiscard]] const KVStore& kv_store() const noexcept { return *kv_; }
     [[nodiscard]] const KVPageGeometry& kv_geometry() const noexcept { return kv_->physical_geometry(); }
     [[nodiscard]] std::size_t attention_workspace_bytes(std::size_t tokens) const;
+    [[nodiscard]] std::size_t hybrid_workspace_bytes(std::size_t tokens) const;
+    [[nodiscard]] MambaDecodeStateView mamba_state_view(std::uint64_t sequence_id, std::uint32_t layer) const;
+    [[nodiscard]] MambaDecodeStateView mamba_candidate_state_view(const qwen_store::StateImageSelectors&, std::uint32_t layer) const;
+    [[nodiscard]] std::int32_t state_physical_slot(qwen_store::StateImageHandle handle) const;
+    [[nodiscard]] std::uint32_t kv_frontier(std::uint64_t sequence_id) const;
+    [[nodiscard]] std::uint64_t active_kv_identity(std::uint64_t sequence_id) const;
+    void copy_candidate_state(const qwen_store::StateImageSelectors&,cudaStream_t) const;
+    [[nodiscard]] std::uint32_t candidate_row(std::uint64_t sequence_id) const;
+    void stage_gptq(const BoundModel&, artifact::MaterializedArtifact&, GptqExecution&) const;
+    void reset_gptq(GptqExecution&,artifact::MaterializedArtifact&) const noexcept;
     [[nodiscard]] std::size_t configure_attention_kv_storage(LayoutBuilder& layout,
                                                               std::uint32_t physical_page_count) const;
+    void execute_layer(std::uint64_t sequence_id, std::uint32_t layer, const BoundModel&,
+                       const artifact::MaterializedArtifact&, GptqExecution&, const Tensor&, Tensor&,
+                       DeviceSpan, std::size_t, cudaStream_t);
+    void run_hybrid_layer(std::uint64_t sequence_id, std::uint32_t layer, const BoundModel&,
+                       const artifact::MaterializedArtifact&, GptqExecution&, const Tensor&, Tensor&,
+                       DeviceSpan, std::size_t, cudaStream_t);
     void run_attention(std::uint64_t sequence_id, std::uint32_t layer, const BoundModel&,
                        const artifact::MaterializedArtifact&, const Tensor& input, Tensor& output,
                        DeviceSpan workspace, std::size_t workspace_bytes, cudaStream_t stream);

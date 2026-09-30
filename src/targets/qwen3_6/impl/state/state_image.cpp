@@ -70,6 +70,18 @@ bool same_host_layout(const StateImageHostLayout& left,
     return same_linear_spec(left.spec.linear, right.spec.linear) &&
            left.spec.hidden == right.spec.hidden &&
            same_dflash_spec(left.spec.dflash_local, right.spec.dflash_local) &&
+           left.spec.falcon.has_value() == right.spec.falcon.has_value() &&
+           (!left.spec.falcon || (left.spec.falcon->layers == right.spec.falcon->layers &&
+             left.spec.falcon->slot_count == right.spec.falcon->slot_count &&
+             left.spec.falcon->conv_channels == right.spec.falcon->conv_channels &&
+             left.spec.falcon->conv_width == right.spec.falcon->conv_width &&
+             left.spec.falcon->ssm_heads == right.spec.falcon->ssm_heads &&
+             left.spec.falcon->head_dim == right.spec.falcon->head_dim &&
+             left.spec.falcon->state_dim == right.spec.falcon->state_dim)) &&
+           same_optional_region(left.falcon_conv, right.falcon_conv) &&
+           same_optional_region(left.falcon_ssm, right.falcon_ssm) &&
+           left.falcon_conv_layer_bytes == right.falcon_conv_layer_bytes &&
+           left.falcon_ssm_layer_bytes == right.falcon_ssm_layer_bytes &&
            same_region(left.linear_conv, right.linear_conv) &&
            left.linear_conv_layer_bytes == right.linear_conv_layer_bytes &&
            same_region(left.linear_recurrent, right.linear_recurrent) &&
@@ -129,6 +141,17 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
         host.dflash_local_v =
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local V");
     }
+    if (spec.falcon) {
+        const auto& f = *spec.falcon;
+        if (f.layers == 0 || f.slot_count == 0 || f.conv_channels != 3584 || f.conv_width != 3 ||
+            f.ssm_heads != 24 || f.head_dim != 128 || f.state_dim != 256) {
+            throw std::invalid_argument("Falcon StateImage must match frozen FP32 state geometry");
+        }
+        host.falcon_conv_layer_bytes = Tensor(nullptr, DType::FP32, {f.conv_channels, f.conv_width}).bytes();
+        host.falcon_ssm_layer_bytes = Tensor(nullptr, DType::FP32, {f.ssm_heads, f.head_dim, f.state_dim}).bytes();
+        host.falcon_conv = builder.add(checked_mul(host.falcon_conv_layer_bytes, f.layers, "Falcon conv payload overflow"), kStateImageAlignment, "Falcon FP32 conv history");
+        host.falcon_ssm = builder.add(checked_mul(host.falcon_ssm_layer_bytes, f.layers, "Falcon ssm payload overflow"), kStateImageAlignment, "Falcon FP32 SSM state");
+    }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
     return host;
 }
@@ -153,6 +176,14 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
 
     StateImageDeviceLayout out;
     out.linear = plan_linear_attention_state_pool(builder, spec.linear);
+    if (spec.falcon) {
+        const auto& f = *spec.falcon;
+        if (f.slot_count != static_cast<std::uint32_t>(spec.linear.slot_count)) throw std::invalid_argument("Falcon state slot count mismatch");
+        for (std::uint32_t layer = 0; layer < f.layers; ++layer) {
+            out.falcon_conv.push_back(builder.add_tensor(DType::FP32, {f.conv_channels, f.conv_width, spec.linear.slot_count}, kStateImageAlignment, "Falcon conv state"));
+            out.falcon_ssm.push_back(builder.add_tensor(DType::FP32, {f.state_dim, f.head_dim, f.ssm_heads, spec.linear.slot_count}, kStateImageAlignment, "Falcon SSM state"));
+        }
+    }
     out.continuation_hidden =
         builder.add_tensor(DType::BF16, {spec.hidden, spec.linear.slot_count}, kStateImageAlignment,
                            "StateImage continuation hidden");
@@ -277,6 +308,13 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
         throw std::invalid_argument("StateImage DFlash layout is inconsistent");
     }
     StateImageSpec device_spec{.linear = layout.linear.spec, .hidden = continuation_hidden_.ne[0]};
+    if (layout.falcon_conv.size() != layout.falcon_ssm.size()) throw std::invalid_argument("StateImage Falcon components mismatch");
+    for (const auto& region : layout.falcon_conv) falcon_conv_.push_back(region.bind(backing));
+    for (const auto& region : layout.falcon_ssm) falcon_ssm_.push_back(region.bind(backing));
+    if (!falcon_conv_.empty()) {
+        const auto& f = *layout.host.spec.falcon;
+        device_spec.falcon = FalconStatePayloadSpec{f.layers, f.slot_count, f.conv_channels, f.conv_width, f.ssm_heads, f.head_dim, f.state_dim};
+    }
     if (layout.dflash_local) {
         device_spec.dflash_local = DFlashLocalStateSpec{
             .layers   = static_cast<std::uint32_t>(layout.dflash_local->k.size()),
@@ -302,7 +340,15 @@ StateImageDeviceSlotView StateImageDevicePool::slot_view(std::int32_t slot) cons
         .continuation_hidden = continuation_hidden_slot(slot),
     };
     if (dflash_local_) { view.dflash_local = dflash_local_->slot_view(slot); }
+    if (!falcon_conv_.empty()) view.falcon = falcon_slot(0, slot);
     return view;
+}
+
+std::optional<FalconStateSlotView> StateImageDevicePool::falcon_slot(std::uint32_t layer, std::int32_t slot) const {
+    validate_slot(slot, slot_count(), "Falcon state slot is out of range");
+    if (layer >= falcon_conv_.size()) throw std::out_of_range("Falcon state layer is out of range");
+    return FalconStateSlotView{falcon_conv_[layer].slice(2, slot, 1).view({3584, 3}),
+                               falcon_ssm_[layer].slice(3, slot, 1).view({256, 128, 24})};
 }
 
 Tensor StateImageDevicePool::continuation_hidden_slot(std::int32_t slot) const {
@@ -321,6 +367,8 @@ const CyclicKVCache* StateImageDevicePool::dflash_local() const noexcept {
 void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_slot(slot, slot_count(), "StateImage zero slot is out of range");
     linear_.zero_slot(slot, stream);
+    for (auto& t : falcon_conv_) { auto a=t.slice(2,slot,1); CUDA_CHECK(cudaMemsetAsync(a.data,0,a.bytes(),stream)); }
+    for (auto& t : falcon_ssm_) { auto a=t.slice(3,slot,1); CUDA_CHECK(cudaMemsetAsync(a.data,0,a.bytes(),stream)); }
     const Tensor hidden = continuation_hidden_slot(slot);
     CUDA_CHECK(cudaMemsetAsync(hidden.data, 0, hidden.bytes(), stream));
     if (dflash_local_) {
@@ -336,6 +384,8 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
 
 void StateImageDevicePool::zero_all(cudaStream_t stream) {
     linear_.zero_all(stream);
+    for (auto& t : falcon_conv_) CUDA_CHECK(cudaMemsetAsync(t.data,0,t.bytes(),stream));
+    for (auto& t : falcon_ssm_) CUDA_CHECK(cudaMemsetAsync(t.data,0,t.bytes(),stream));
     CUDA_CHECK(cudaMemsetAsync(continuation_hidden_.data, 0, continuation_hidden_.bytes(), stream));
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
@@ -352,6 +402,8 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
     validate_slot(destination, slot_count(), "StateImage copy destination is out of range");
     if (source == destination) { return; }
     linear_.copy_slot(source, destination, stream);
+    for (auto& t : falcon_conv_) { auto a=t.slice(2,source,1), b=t.slice(2,destination,1); CUDA_CHECK(cudaMemcpyAsync(b.data,a.data,a.bytes(),cudaMemcpyDeviceToDevice,stream)); }
+    for (auto& t : falcon_ssm_) { auto a=t.slice(3,source,1), b=t.slice(3,destination,1); CUDA_CHECK(cudaMemcpyAsync(b.data,a.data,a.bytes(),cudaMemcpyDeviceToDevice,stream)); }
     const Tensor source_hidden      = continuation_hidden_slot(source);
     const Tensor destination_hidden = continuation_hidden_slot(destination);
     CUDA_CHECK(cudaMemcpyAsync(destination_hidden.data, source_hidden.data,
@@ -398,6 +450,11 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
     CUDA_CHECK(
         cudaMemcpyAsync(byte_offset(destination.data, host_layout_.continuation_hidden.offset),
                         hidden.data, hidden.bytes(), cudaMemcpyDeviceToHost, stream));
+    for (std::size_t layer = 0; layer < falcon_conv_.size(); ++layer) {
+        auto c=falcon_conv_[layer].slice(2,source,1), s=falcon_ssm_[layer].slice(3,source,1);
+        CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination.data,host_layout_.falcon_conv->offset+layer*host_layout_.falcon_conv_layer_bytes),c.data,c.bytes(),cudaMemcpyDeviceToHost,stream));
+        CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination.data,host_layout_.falcon_ssm->offset+layer*host_layout_.falcon_ssm_layer_bytes),s.data,s.bytes(),cudaMemcpyDeviceToHost,stream));
+    }
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
@@ -438,6 +495,11 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     CUDA_CHECK(cudaMemcpyAsync(hidden.data,
                                byte_offset(source.data, host_layout_.continuation_hidden.offset),
                                hidden.bytes(), cudaMemcpyHostToDevice, stream));
+    for (std::size_t layer = 0; layer < falcon_conv_.size(); ++layer) {
+        auto c=falcon_conv_[layer].slice(2,destination,1), s=falcon_ssm_[layer].slice(3,destination,1);
+        CUDA_CHECK(cudaMemcpyAsync(c.data,byte_offset(source.data,host_layout_.falcon_conv->offset+layer*host_layout_.falcon_conv_layer_bytes),c.bytes(),cudaMemcpyHostToDevice,stream));
+        CUDA_CHECK(cudaMemcpyAsync(s.data,byte_offset(source.data,host_layout_.falcon_ssm->offset+layer*host_layout_.falcon_ssm_layer_bytes),s.bytes(),cudaMemcpyHostToDevice,stream));
+    }
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);

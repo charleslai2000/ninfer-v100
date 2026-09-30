@@ -196,6 +196,13 @@ int main() {
         require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
                     materialized.device_arena().used() == plan.device_capacity_bytes,
                 "materialized tensor does not own the planned device backing");
+        int cleaned=0;auto* staged=static_cast<int*>(materialized.device_allocate(sizeof(int),256));
+        materialized.register_device_cleanup(&cleaned,[&cleaned]{++cleaned;});
+        require(staged!=nullptr&&materialized.device_allocation_generation()==1,"persistent staging allocation exists");
+        materialized.reset_device_allocations();
+        require(cleaned==1&&materialized.device_allocation_generation()==2,"reset releases registered staging owners and advances generation");
+        materialized.reset_device_allocations();
+        require(cleaned==1,"repeat reset is idempotent");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

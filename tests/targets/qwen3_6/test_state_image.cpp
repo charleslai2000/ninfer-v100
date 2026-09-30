@@ -46,6 +46,7 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false)
                 .conv_dtype     = ninfer::DType::BF16,
             },
         .hidden = 7,
+        .falcon = q36::FalconStatePayloadSpec{.layers=2,.slot_count=static_cast<std::uint32_t>(slots)},
     };
     if (dflash) {
         spec.dflash_local = dflash2
@@ -82,6 +83,7 @@ void fill_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char
         set_bytes(pool.linear().conv_slot(layer, slot), static_cast<unsigned char>(base + layer));
         set_bytes(pool.linear().recurrent_slot(layer, slot),
                   static_cast<unsigned char>(base + 0x10 + layer));
+        if (auto f=pool.falcon_slot(layer,slot)) { set_bytes(f->conv,static_cast<unsigned char>(base+layer)); set_bytes(f->ssm,static_cast<unsigned char>(base+layer)); }
     }
     set_bytes(pool.continuation_hidden_slot(slot), static_cast<unsigned char>(base + 0x20));
     if (ninfer::CyclicKVCache* local = pool.dflash_local(); local != nullptr) {
@@ -103,6 +105,7 @@ void expect_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned ch
     }
     expect_bytes(pool.continuation_hidden_slot(slot), static_cast<unsigned char>(base + 0x20),
                  label);
+    for(std::uint32_t layer=0;layer<pool.falcon_layer_count();++layer)if(auto f=pool.falcon_slot(layer,slot)){expect_bytes(f->conv,static_cast<unsigned char>(base+layer),label);expect_bytes(f->ssm,static_cast<unsigned char>(base+layer),label);}
     if (ninfer::CyclicKVCache* local = pool.dflash_local(); local != nullptr) {
         for (std::uint32_t layer = 0; layer < local->layer_count(); ++layer) {
             const auto view = local->layer_view(layer);
@@ -120,6 +123,7 @@ void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::s
         expect_bytes(pool.linear().recurrent_slot(layer, slot), 0, label);
     }
     expect_bytes(pool.continuation_hidden_slot(slot), 0, label);
+    for(std::uint32_t layer=0;layer<pool.falcon_layer_count();++layer)if(auto f=pool.falcon_slot(layer,slot)){expect_bytes(f->conv,0,label);expect_bytes(f->ssm,0,label);}
     if (ninfer::CyclicKVCache* local = pool.dflash_local(); local != nullptr) {
         for (std::uint32_t layer = 0; layer < local->layer_count(); ++layer) {
             const auto view = local->layer_view(layer);
@@ -187,6 +191,10 @@ int main() {
 
     expect(pool.slot_count() == 4, "StateImage slot count");
     expect(pool.linear().layer_count() == 2, "StateImage Linear Attention layer count");
+    expect(pool.falcon_layer_count() == 2, "Falcon exact payload layer count");
+    auto fs=pool.falcon_slot(0,0);
+    expect(fs && fs->conv.dtype==ninfer::DType::FP32 && fs->conv.ne[0]==3584 && fs->conv.ne[1]==3 && fs->conv.bytes()==3584U*3U*4U, "Falcon conv payload FP32 [3584,3]");
+    expect(fs && fs->ssm.dtype==ninfer::DType::FP32 && fs->ssm.ne[0]==256 && fs->ssm.ne[1]==128 && fs->ssm.ne[2]==24 && fs->ssm.bytes()==24U*128U*256U*4U, "Falcon SSM payload FP32 [24,128,256]");
     expect(pool.continuation_hidden_slot(0).dtype == ninfer::DType::BF16 &&
                pool.continuation_hidden_slot(0).ne[0] == 7,
            "StateImage continuation hidden geometry");
@@ -204,6 +212,15 @@ int main() {
     device.synchronize();
     expect_slot(pool, 0, 0x11, "StateImage D2D source isolation");
     expect_slot(pool, 2, 0x11, "StateImage D2D complete destination");
+    auto src_f=pool.falcon_slot(0,0), dst_f=pool.falcon_slot(0,2);
+    expect_bytes(src_f->conv,0x11,"Falcon state source seed");
+    expect_bytes(dst_f->conv,0x11,"Falcon candidate clone conv");
+    CUDA_CHECK(cudaMemset(dst_f->conv.data,0x77,dst_f->conv.bytes()));
+    CUDA_CHECK(cudaMemset(dst_f->ssm.data,0x66,dst_f->ssm.bytes()));
+    expect_bytes(src_f->conv,0x11,"Falcon candidate mutation leaves previous conv generation intact");
+    expect_bytes(src_f->ssm,0x11,"Falcon candidate mutation leaves previous SSM generation intact");
+    pool.copy_slot(0,3,device.stream); device.synchronize();
+    expect_bytes(pool.falcon_slot(0,3)->conv,0x11,"Falcon rollback recovery clone restores previous generation");
 
     pool.zero_slot(1, device.stream);
     device.synchronize();

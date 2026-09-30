@@ -922,6 +922,9 @@ public:
                addresses_[handle.index_].occupied &&
                addresses_[handle.index_].generation == handle.generation_;
     }
+    [[nodiscard]] std::uint64_t identity(KVAddressSpaceHandle handle) const {
+        (void)require(handle); return (static_cast<std::uint64_t>(handle.generation_)<<32)|handle.index_;
+    }
 
     void activate(KVAddressSpaceHandle handle, std::uint32_t entitlement,
                   std::int32_t execution_row) {

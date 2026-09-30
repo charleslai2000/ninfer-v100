@@ -6,6 +6,7 @@
 #include <cstdint>
 namespace ninfer::targets::falcon_h1 {
 struct MambaDecodeStateView {float* compact_conv=nullptr;float* ssm=nullptr;};
+[[nodiscard]] float falcon_ssm_out_multiplier();
 struct MambaDecodeTaps {float *in_proj=nullptr,*z=nullptr,*xbc=nullptr,*dt_split=nullptr,*conv=nullptr,*x=nullptr,*b=nullptr,*c=nullptr,*dt=nullptr,*da=nullptr,*raw_ssm=nullptr,*gated=nullptr,*gated_norm=nullptr,*out_proj=nullptr,*conv_state=nullptr,*ssm_state=nullptr;};
 struct MambaDecodeWorkspace {float *projection=nullptr,*conv_output=nullptr,*x=nullptr,*b=nullptr,*c=nullptr,*dt=nullptr,*da=nullptr,*raw_ssm=nullptr,*gated=nullptr,*gated_norm=nullptr,*output=nullptr;std::size_t bytes=0;};
 std::size_t mamba_decode_workspace_bytes();
