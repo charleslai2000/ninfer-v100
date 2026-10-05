@@ -2,7 +2,7 @@
 
 ## G010-s4-v100-decode-saturation
 - T001 V100 decode saturation and graph coverage — ACTIVE
-  - frontier: establish authorized DCGM/NCU counter access, then a bounded warm-window CUDA-only Nsight Systems trace and decode semantic owner/efficiency ledger; pause prefill/economics until decode closes.
+  - frontier: diagnose why no report emerged from two warm profile-wrapped launches despite c96 graph96 forward and opt-in worker NVTX; do not add another profiler harness; fall back to authorized in-process CUDA-event/NVTX if range delivery remains unverified.
   - task: `G010-s4-v100-decode-saturation/tasks/T001-decode-saturation-and-graph-coverage.md`
 
 G009-S3-FALCON-V100-RTX3090-FORENSICS
