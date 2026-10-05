@@ -5,12 +5,12 @@
 - Falcon correctness baseline: `07343bd165855e9cd35ae63acea6cee5819c8c4e`.
 - Execute only on `gpushare-v100` Tesla V100-SXM2-32GB using frozen source/runtime extraction `/hy-tmp/sglang-V100-s2-07343bd165` and pinned checkpoint revision `52036ae497a2c0c253e17f98cc8652f2f7082ae3`.
 - RTX 3090 is fixed reference only; no access/build/run/profile/requalification.
-- No new kernels or model math. Prefill graph optimization deferred.
+- Latest priority revision: single-card decode saturation first, NVIDIA hardware profiling before timing inference, then separately measure prefill. Pause purchase economics, 8-card estimates, and new serving features. No new kernels or model math absent separate authorization. Prefill must not start until decode saturation/owner ledger close.
 - The frozen `sglang-V100` repository is not mounted in the current local runtime. Current durable S4 experiment and control records are under `ninfer-v100-falcon-h1-7b/experiments/S004-v100-decode-saturation/` and its `control/G010-s4-v100-decode-saturation/`; remote raw logs are under `/hy-tmp/sglang-logs/`. Earlier local attempts under `.pi/experiments` in a different repository are not authoritative.
 
 ## Objective
 
-Determine V100 steady-state decode throughput saturation by increasing concurrency and maximizing graph replay coverage. Record aggregate/per-request tok/s, ITL, graph/eager pass deltas, actual scheduler batch histogram, VRAM, power and utilization. Compare graph sets from observed distribution; use smallest set covering useful operating region. Add/validate only low-overhead framework/CUDA-event telemetry; no repeated Nsight injection or privileged NCU counter attempts.
+Determine single-card V100 decode saturation and GPU owners with NVIDIA DCGM/Nsight first. Use one minimal warm-window Nsight Systems capture (CUDA-only, graph-level, NVTX-bounded, no CPU sampling/backtrace), DCGM where installed, then NCU only on top owner kernels after an authorized counter-permission procedure. If counter access remains unavailable, use DCGM + CUDA-event real-tensor measurements and explicitly report missing evidence. Optimize decode graph sets using actual scheduler histograms. After decode closes, separately measure 1K/4K/~8K prefill. No economics/multi-card estimate in this phase.
 
 ## Workload and controls
 
@@ -41,9 +41,9 @@ Every listed concurrency wave uses 1K prompt, 256 output, disabled radix cache, 
 | 56 | 339.25 | 6.06 | ~133.1 | graph56, ~100% | — |
 | 64 | 359.17 | 5.61 | ~138.5 | graph64, ~100% | 8.09GB weights, KV 5.50GB (token capacity 131,072), graph 0.51GB in comparison server |
 | 80 | 375.07 | 4.69 | ~168.2 | graph80, ~100% | same c96 server/pools |
-| 96 | 391.33 | 4.08 | ~192.5 | graph96, ~100% | 8.09GB weights, KV 7.04GB (167,664 tokens), graph 0.51GB; startup free headroom 2.54GB |
-| 104 | 400.74 | 3.85 | not captured validly | graph104, ~100% | KV 6.00GB, graph 0.31GB, but startup free headroom <2GB |
-| 112 | **410.64** | 3.66 | **210.8** | graph112, ~100% | KV 6.21GB (148,080 tokens), graph 0.31GB; Mamba cache size 112 => state increment 14.79GiB plus padding; startup free headroom only 1.34GB |
+| 96 | 391.20±0.98 | 4.08 | see validated row summaries | graph96, exactly 256/256 | 8.09GB weights, KV 7.04GB (167,664 tokens), graph 0.30GB sparse; startup free headroom ~2.75GB |
+| 104 | 400.74±0.80 | 3.85 | see validated row summaries | graph104, exactly 256/256 | KV 6.00GB, graph 0.31GB; resources not yet continuous |
+| 112 | **411.20±1.20** | 3.67 | **~211** | graph112, exactly 256/256 | KV 6.21GB (148,080 tokens), graph 0.31GB; startup free headroom only 1.34GB |
 | 120 | 311.33 (not plateau evidence) | 2.59 | — | observed batch96 + batch24, both graphs | KV pool max 123,344 tokens; 120×(1024+256) workload triggers admission/batch splitting |
 | 128 | 322.73 (not plateau evidence) | 2.52 | — | observed batch53 + batch22 | 68,688-token effective cap, KV-limited; full batch128 did not form |
 
@@ -83,8 +83,8 @@ c8 V100 153.0 / historical 3090 371.2 = **0.412×**; c12 V100 172.7 / 3090 485.7
 
 S2 baseline uses 8.09GB weights, residual runtime/static allowance rounded up to 2.5GiB, graphs budget 0.25GiB (S4 sparse sets require 0.30GB at c96/c112), and >=2GiB safety margin. FP16 KV is ~45,056 bytes/token (44KiB). Mamba per logical request is 0.1320GiB plus one 0.1320GiB dummy slot. At 1K prompt+256 output per request, 4K tokens cover up to 4 requests conservatively; 24,576 token pool recommended by S2 covers 8 such requests. The S2 conservative operational default remains c4 and c8 only for short contexts after actual-device validation. S2 already recommended 16GiB 24,576 total tokens, default max-running 4, graphs 1/2/4, no piecewise, >=2GiB remaining. This remains conditional, not physical qualification.
 
-An S4 high-concurrency extrapolation from the actual 32GB configuration is infeasible to assert on 16GB: Mamba alone uses (S+1)×0.1320GiB, so c8/c12/c16 = 1.19/1.72/2.24GiB; KV for 24,576 tokens ~1.03GiB and graph ~0.30GB. Combined with weights 8.09GB + runtime reserve 2.5GiB + >=2GiB safety, c8 is a plausible *budget candidate* (~15.1GiB before conventions/allocator); c12 is marginal/no safety (~15.6GiB); c16 exceeds (~16.1GiB). S2 keeps the operational recommendation c4 by default and c8 as the conditional short-context cap; do not promote c12/c16 without a physical 16GB run and exact allocator/cap evidence.
+The previously recorded 16GB sizing remains historical, outside the latest S4 priority and is not advanced here. No purchasing economics or eight-card extrapolation is being performed.
 
 ## Remaining S4 work
 
-S4 acceptance is not yet met. Required remaining tasks: (1) produce clean, parseable raw per-wave JSONL for c1-112 after final harness correction; (2) get c96/c112 telemetry on/off overhead paired; (3) capture per-wave peak power, utilization and VRAM with SMI sampler; (4) quantify eager pass rate/padding from exact histogram at operating points and graph-set same-workload A/B; (5) establish >=2GiB-headroom highest useful c point and rank/root bottleneck; (6) finish 16GB budget with all conventions explicit; (7) update report/control and push commit. No profiler retries or prefill-graph tests in S4.
+S4 acceptance is not yet met. Required remaining tasks: (1) establish authorized DCGM/NCU counter access; (2) obtain one valid warmed graph-level CUDA-only Nsight Systems timeline (if it fails again, diagnose and do not build another harness); (3) construct ordered decode owner ledger, profile top few kernels with NCU, assess mature donors and bound recoverable software residual; (4) optimize graph sets from scheduler histograms and determine maximum stable full-batch decode TPS; (5) only after decode closes, obtain separate prefill owner ledger at 1K/4K/~8K; (6) report phase-separated before/after and remaining software vs hardware gap. No new kernel work without explicit later authorization.

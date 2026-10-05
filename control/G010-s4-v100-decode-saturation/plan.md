@@ -9,7 +9,7 @@
 - Nsight Compute 2025.1.1 and Nsight Systems binaries exist on gpushare-v100. `ncu --query-metrics --devices 0` gives `ERR_NVGPUCTRPERM`; `/proc/driver/nvidia/params` says `RmProfilingAdminOnly:1`. `perf_event_paranoid=4`; Nsight reports CPU perf sampling unavailable. DCGM tools/service are absent.
 - SSH session uid is root, but no authorized reversible module-admin procedure has been established; no driver module/sysctl state has been changed. Need legitimate profiling permission before counter claims.
 - A c96 S4 server was stopped before sending requests after GPU showed 29,670MiB foreign occupancy. Subsequent device check showed 1MiB/0% and no S4 process. No foreign process was terminated.
-- Curves/corrupt harness artifacts and correctness caveats are recorded in `experiments/S004-v100-decode-saturation/README.md` and `experiment.md`. Newer final protocol is in `NVIDIA-PROFILING-BLOCKER.md`.
+- Curves/correctness caveats are recorded in `experiments/S004-v100-decode-saturation/README.md` and `experiment.md`. Literal-separator source JSON objects are preserved and normalized; hashes/evidence are in `PROFILE-ARTIFACT-AUDIT.md`. The blocker/one-capture protocol is in `NVIDIA-PROFILING-BLOCKER.md`; warmed attach script is `profile_decode_window.sh` and requires existing layerwise NVTX marker plus no CPU profiling.
 
 ## Decisive frontier
 

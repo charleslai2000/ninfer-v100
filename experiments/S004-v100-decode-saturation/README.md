@@ -1,6 +1,6 @@
 # S4 progress record — 2026-10-05
 
-This is an ACTIVE interim evidence log, not the S4 completion report. The canonical runtime source is frozen S1 (`07343bd165855e9cd35ae63acea6cee5819c8c4e`) in remote extraction `/hy-tmp/sglang-V100-s2-07343bd165`. RTX 3090 was not accessed. The local `sglang-V100` repository is not mounted in this execution runtime; this record and control state therefore live in the currently mounted `ninfer-v100-falcon-h1-7b` repository. Earlier `.pi` records copied to a different SGLang checkout were removed from consideration.
+This is an ACTIVE interim evidence log, not the S4 completion report. The latest priority supersedes interim plans to examine SKU economics or 8-card estimates. First establish 32GB V100 decode NVIDIA owner ledger/saturation; prefill separately only after decode closes. The canonical runtime source is frozen S1 (`07343bd165855e9cd35ae63acea6cee5819c8c4e`) in remote extraction `/hy-tmp/sglang-V100-s2-07343bd165`. RTX 3090 was not accessed. The local `sglang-V100` repository is not mounted in this execution runtime; this record and control state therefore live in the currently mounted `ninfer-v100-falcon-h1-7b` repository. Earlier `.pi` records copied to a different SGLang checkout were removed from consideration.
 
 ## Valid completed evidence
 
