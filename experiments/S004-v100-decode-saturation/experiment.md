@@ -10,7 +10,7 @@
 
 ## Objective
 
-Determine single-card V100 decode saturation and GPU owners with NVIDIA DCGM/Nsight first. Use one minimal warm-window Nsight Systems capture (CUDA-only, graph-level, NVTX-bounded, no CPU sampling/backtrace), DCGM where installed, then NCU only on top owner kernels after an authorized counter-permission procedure. If counter access remains unavailable, use DCGM + CUDA-event real-tensor measurements and explicitly report missing evidence. Optimize decode graph sets using actual scheduler histograms. After decode closes, separately measure 1K/4K/~8K prefill. No economics/multi-card estimate in this phase.
+Establish single-card V100 decode saturation and semantic GPU owners. First use one low-distortion supported Nsight Systems warm-window capture (CUDA/NVTX only, graph granularity, no CPU sampling/backtrace), and validate A/B overhead. If no timeline can be produced after the bounded launch investigation, fall back to in-process CUDA event/NVTX owner timing and record the Systems limitation. NCU/CUPTI counters are deferred under current permission policy; no DCGM installation or driver changes. Decode graph/owner analysis precedes separate prefill 1K/4K/~8K. Economics/multi-card is paused.
 
 ## Workload and controls
 
