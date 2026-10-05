@@ -2,7 +2,7 @@
 
 ## G010-s4-v100-decode-saturation
 - T001 V100 decode saturation and graph coverage — ACTIVE
-  - frontier: run covered concurrency curve and matched graph-set telemetry A/B on frozen V100 runtime; quantify resource and 16GB budget.
+  - frontier: establish authorized DCGM/NCU counter access, then a bounded warm-window CUDA-only Nsight Systems trace and decode semantic owner/efficiency ledger; pause prefill/economics until decode closes.
   - task: `G010-s4-v100-decode-saturation/tasks/T001-decode-saturation-and-graph-coverage.md`
 
 G009-S3-FALCON-V100-RTX3090-FORENSICS

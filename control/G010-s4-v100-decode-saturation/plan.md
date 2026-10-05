@@ -1,33 +1,30 @@
-# Plan: S4 V100 decode saturation and graph coverage
+# Plan: S4 V100 single-card decode and prefill ceiling
 
 ## Current evidence
 
-- Frozen S1 V100 base is correct; no model/kernel changes. V100 access remains only on `gpushare-v100` extraction `/hy-tmp/sglang-V100-s2-07343bd165`; final active benchmark server has been stopped, GPU 1 MiB/0%.
-- Correctness test bug found and fixed for measurements: original harness accepted partial SSE deltas and did not require all 256 token IDs nonzero. Use complete non-stream responses as gate; do not infer correctness from SSE array length. Different requests may produce slightly different greedy token sequences, so exact cross-request sequence equality is not a correctness condition.
-- Source-derived SGLang decode-batch histogram instrumentation is opt-in and does one integer increment per completed decode step. It was applied only to disposable remote extraction, not repo source.
-- Curves show full-batch throughput continues rising through c112. c120 was KV-limited (actual batches 96+24, ~311 tok/s). c128 at normal static reserve hit max_total token-pool cap and split into smaller batches. Lowering `mem_fraction_static` to .80 left only 8,880 KV tokens and caused unusably tiny microbatches; rejected.
-- At c112/max-running112, `mem_fraction_static=.92`, graph set `[1,112]`: weights 8.09GB, KV 6.21GB/148,080 tokens, graph 0.31GB, pool Mamba allocated 112 slots (temporal 14.57GB logged, plus conv), available after pool/capture only 1.34GB. This does not meet required 2GB safety margin.
-- c112 with full capture `[1,2,4,8,12,16,24,32,40,48,56,64,72,80,88,96,104,112]` consumed 0.55GB graph vs 0.31GB `[1,112]`; both measured ~410 tok/s, so the sparse exact operating-point set saves ~0.24GB without measurable throughput loss for sustained c112. Need choose stable production baseline respecting headroom.
-- c96 same-policy complete requests about 391 tok/s; c104 about 400.7; c112 ~410.4 (three repeats, all outputs complete/nonzero). Historical 3090 c24 peak 495.1 is not a comparable batch, do not overclaim ratio.
-- Some remote JSONL artifacts from early harness versions are corrupt (literal `\\n` delimiters and oversized request detail). Trust printed observations and correct separate logs; final compact JSONL runner still needs validation/final clean recording. Keep that issue explicit.
+- Frozen S1 Falcon serving baseline `07343bd165855e9cd35ae63acea6cee5819c8c4e` remains the only runtime; no model math/kernel changes. RTX 3090 historical ~495 tok/s is a reference only and has not been remeasured.
+- Existing 32GB V100 decode observations (1K prompt/256 output), recovered and revalidated from literal-`\\n`-separated source rows: c96 sparse mean 391.20±0.98 tok/s (n=3), c104 400.74±0.80 (n=3), c112 411.20±1.20 (n=3). All outputs were complete/nonzero, graph histogram showed exactly 256 decode forwards at intended batch, and row-wise normalized JSONL is hash-checked under `/hy-tmp/sglang-logs/*validated.jsonl`. c112 leaves ~1.34GiB. These demonstrate neither hardware ceiling nor fully bounded software residual.
+- c120 was KV-admission split 96+24, invalid as a full-batch saturation point. Previous graph memory result: c96 sparse ~0.30GB vs complete set ~0.51GB; c112 sparse `[1,112]` ~0.31GB vs complete ~0.55GB, without observed throughput loss. Revalidate from actual histogram.
+- Existing S3 report audit: `s3-v100-nsys-decode` and `s3-v100-prewarmed` have no CUDA/kernel data; `s3-v100-traced-server` contains ~340ms NCCL init, 2 CUB inclusive-scan NVTX events, and no CUDA kernels (warmup ended before a Falcon forward). This is not an owner trace. Do one distinct minimally intrusive, warmed graph-level CUDA/NVTX capture with no CPU sampling/backtrace; if it crashes, inspect interaction and stop adding harnesses.
+- Nsight Compute 2025.1.1 and Nsight Systems binaries exist on gpushare-v100. `ncu --query-metrics --devices 0` gives `ERR_NVGPUCTRPERM`; `/proc/driver/nvidia/params` says `RmProfilingAdminOnly:1`. `perf_event_paranoid=4`; Nsight reports CPU perf sampling unavailable. DCGM tools/service are absent.
+- SSH session uid is root, but no authorized reversible module-admin procedure has been established; no driver module/sysctl state has been changed. Need legitimate profiling permission before counter claims.
+- A c96 S4 server was stopped before sending requests after GPU showed 29,670MiB foreign occupancy. Subsequent device check showed 1MiB/0% and no S4 process. No foreign process was terminated.
+- Curves/corrupt harness artifacts and correctness caveats are recorded in `experiments/S004-v100-decode-saturation/README.md` and `experiment.md`. Newer final protocol is in `NVIDIA-PROFILING-BLOCKER.md`.
 
 ## Decisive frontier
 
-Establish best deployable concurrency at >=2GB GPU reserve; verify c96 sparse/full set memory and throughput tradeoff with valid compact JSONL. Quantify scheduler graph/eager pass totals plus true batch histogram. Validate telemetry overhead once against uninstrumented config. Finish short-context 16GB candidate budget, exact configs, rank resource samples and clean service shutdown; then commit/push final experiment/control results.
+First: use authorized NVIDIA/DCGM permission route or establish DCGM availability; capture stable decode using one bounded warm NVTX range with graph-level trace and CUDA-only activity. Produce ordered semantic owner ledger and targeted NCU hardware metrics on the top few owners. Do not start prefill until decode saturation and owner analysis close.
 
-## Established
+## Remaining sequence
 
-- Frozen baseline and S3 accepted graph8/Mamba facts as listed above.
-- S4 has measured covered concurrency to c112. Best full-batch point is ~410.7 tok/s at c112, graph replay 255–256/256, exact batch112 histogram; however available VRAM reserve is only 1.34 GiB, short of required >=2GiB. Thus c112 is measured but not yet the deployable recommendation.
-- c96 clean pool has 8.09GB weights, 7.04GB KV for 167,664 tokens, 0.51GB full graph set, 2.54GB startup headroom. Sparse `[1,96]` changes graph memory to 0.30GB and leaves ~2.75GB; throughput is ~391 tok/s either way.
-- c120+ at the existing memory plan does not form one full batch after prefill (KV-bound); c120 splits to 96+24 and regresses. c128 normal pool also splits to 53+22. `mem_fraction_static=.80` leaves only 8,880 tokens, pathological microbatches, and is rejected.
-- Source histogram instrumentation is opt-in, in-memory one-counter-per-step, applied only to disposable remote extraction. No permanent runtime/kernel math changes.
-- Current S4 report/work materials are under `experiments/S004-v100-decode-saturation/` in the visible `ninfer-v100-falcon-h1-7b` workspace; remote logs remain at `/hy-tmp/sglang-logs/`. The local `sglang-V100` checkout is not mounted in this current runtime. No other-repo path is authoritative.
+1. When shared V100 idle: repeat validated covered c96/c104/c108/c112 full-batch points (and justified intermediate points), at least three correct repeats; compact one-row-per-wave JSONL, histogram, graph/eager, VRAM, power/clocks/utilization. Optimize sparse graph set by actual scheduler distribution. Mark `MAX_THROUGHPUT`; do not enforce 2GiB safety reserve as user now prioritizes maximum stable throughput; prevent OOM/instability.
+2. Install/use NVIDIA DCGM only with approved host process; enumerate actual supported metric groups. Capture repeated stable decode/prefill DCGM samples and A/B telemetry overhead.
+3. One warm steady-state Nsight Systems server capture, graph-level, no CPU sampling/backtrace, bounded with NVTX; verify GPU timeline, GPU-active/idle fraction, replay gaps, API launches/sync, kernel families and counts. If crash, preserve logs and analyze tool/runtime interaction; no second harness.
+4. Join kernels to Falcon callsites/semantic roles. Rank by total device time/count. Target NCU to leading few exact kernels with `--kernel-name`/range and documented metrics. If permissions cannot be obtained, use DCGM + CUDA-event real-shape bench but do not say NCU proved efficiency.
+5. For each leading residual inspect mature frozen `sglang-V100`/upstream/1Cat V100 donor routes; quantify realistic recoverable software budget. No kernel work before new explicit authorization.
+6. Once decode is closed, separately benchmark 1K/4K/~8K prefill with warmed minimal capture and its own owner ledger; assess prefill graphs only with service A/B.
+7. Complete optimization/service A/B, residual before/after, and evidence-bounded software vs hardware remainder. SKU economics/8-card estimates remain paused.
 
-## Decisive frontier
+## Current decisive state
 
-Finish highest operating point with >=2GiB headroom and graph-set selection; validate telemetry overhead, retain exact scheduler batch/passes and power/utilization sampling. Correctly parse streaming cumulative output to obtain ITL and produce parseable compact raw manifests. Complete conditional 16GB estimates and commit/push final records only after acceptance.
-
-## Next action
-
-Run matched c96 full vs sparse graph set with final compact JSONL; sample GPU resources over the entire wave; use idle teardown after measurement. Then derive 16GB budget and finalize task/plan/frontier.
+ACTIVE. No NVIDIA-tool-backed Falcon owner ledger, DCGM metric capture, valid Nsight GPU timeline, targeted NCU result, prefill owner ledger, or proven saturation ceiling exists. Exact blocker is counter profiling restricted by driver parameter plus absent DCGM tooling; next decisive condition is authorized profiling-enablement procedure and stable isolated V100 window.
